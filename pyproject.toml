@@ -26,6 +26,11 @@ dev = [
   "black",
   "flake8",
 ]
+onnx = [
+  "onnx>=1.14",
+  "onnxmltools>=1.12",
+  "onnxruntime>=1.16",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -97,6 +97,26 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         check_is_fitted(self, "model_")
         return self.model_.predict(X)
 
+    def to_onnx(self, path: str) -> None:
+        """
+        Export the trained model to an ONNX file.
+
+        Requires the optional ``onnx`` extras:
+            pip install zsxgboost[onnx]
+
+        The exported model accepts a float32 input named ``"float_input"``
+        with shape ``(n_samples, n_features)`` and produces two outputs:
+          - ``"label"``         int64  (n_samples,)   — predicted class
+          - ``"probabilities"`` float32 (n_samples, 2) — [P(0), P(1)]
+
+        Parameters
+        ----------
+        path : str
+            Destination file path, e.g. ``"model.onnx"``.
+        """
+        check_is_fitted(self, "model_")
+        _export_onnx(self.model_, path, self.profile_.n_features)
+
 
 class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
     """
@@ -165,10 +185,47 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         check_is_fitted(self, "model_")
         return self.model_.predict(X)
 
+    def to_onnx(self, path: str) -> None:
+        """
+        Export the trained model to an ONNX file.
+
+        Requires the optional ``onnx`` extras:
+            pip install zsxgboost[onnx]
+
+        The exported model accepts a float32 input named ``"float_input"``
+        with shape ``(n_samples, n_features)`` and produces one output:
+          - ``"variable"`` float32 (n_samples, 1) — predicted values
+
+        Parameters
+        ----------
+        path : str
+            Destination file path, e.g. ``"model.onnx"``.
+        """
+        check_is_fitted(self, "model_")
+        _export_onnx(self.model_, path, self.profile_.n_features)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _export_onnx(model, path: str, n_features: int) -> None:
+    """Convert an XGBoost sklearn estimator to ONNX and write to path."""
+    try:
+        from onnxmltools.convert import convert_xgboost
+        from onnxmltools.convert.common.data_types import FloatTensorType
+    except ImportError:
+        raise ImportError(
+            "ONNX export requires optional dependencies. "
+            "Install them with:  pip install zsxgboost[onnx]"
+        )
+    onnx_model = convert_xgboost(
+        model,
+        initial_types=[("float_input", FloatTensorType([None, n_features]))],
+    )
+    with open(path, "wb") as f:
+        f.write(onnx_model.SerializeToString())
+
 
 def _validation_split(X, y, profile: DatasetProfile, stratify: bool):
     """
