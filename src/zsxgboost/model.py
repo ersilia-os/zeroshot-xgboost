@@ -1,15 +1,25 @@
 """
 Sklearn-compatible estimators backed by zero-shot XGBoost parameter selection.
 
+Training always uses the low-level xgb.train() API with QuantileDMatrix so
+that quantile boundaries are computed once on the training split and reused
+for the validation split via the ref= parameter. This is the fastest path
+regardless of dataset size.
+
 Both ZeroShotXGBClassifier and ZeroShotXGBRegressor follow the standard
 sklearn fit/predict API. On .fit(), they:
   1. Profile the dataset via inspect()
   2. Select hyperparameters via get_params()
-  3. Split off a validation set for early stopping
-  4. Train an XGBoost model
+  3. Split off a 10% validation set (stratified for classification)
+  4. Build QuantileDMatrix for train and val (shared quantile boundaries)
+  5. Train via xgb.train() with early stopping
 
-The chosen parameters are accessible via the .params_ property after fitting.
+The chosen parameters are accessible via .params_ after fitting.
+The best boosting round is in .best_iteration_.
 """
+
+import os
+import tempfile
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
@@ -21,8 +31,8 @@ from .inspector import inspect as _inspect, DatasetProfile
 from .params import get_params as _get_params
 
 
-_VAL_FRACTION = 0.1   # fraction of training data used as early-stopping validation set
-_VAL_MIN_ROWS = 200   # minimum rows to bother with a validation split
+_VAL_FRACTION = 0.1
+_VAL_MIN_ROWS = 200
 _RANDOM_STATE = 42
 
 
@@ -36,7 +46,15 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         "cpu" or "gpu".
     verbose : bool
         If True, print the chosen parameters before training and XGBoost's
-        training log.
+        per-round eval log.
+
+    Attributes (after .fit())
+    --------------------------
+    profile_ : DatasetProfile
+    params_ : dict
+    booster_ : xgb.Booster
+    best_iteration_ : int
+    classes_ : ndarray
     """
 
     def __init__(self, device: str = "cpu", verbose: bool = False):
@@ -44,18 +62,6 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         self.verbose = verbose
 
     def fit(self, X, y):
-        """
-        Profile X and y, select parameters, and train.
-
-        Parameters
-        ----------
-        X : array-like or scipy sparse, shape (n_samples, n_features)
-        y : array-like, shape (n_samples,)  — binary labels (0/1)
-
-        Returns
-        -------
-        self
-        """
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="binary_classification")
         params = _get_params(profile, device=self.device)
@@ -69,33 +75,24 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         X_train, X_val, y_train, y_val = _validation_split(
             X, y, profile, stratify=True
         )
-
-        xgb_params = {k: v for k, v in params.items()
-                      if k not in ("early_stopping_rounds", "eval_metric")}
-        self.model_ = xgb.XGBClassifier(
-            **xgb_params,
-            early_stopping_rounds=params["early_stopping_rounds"],
-            eval_metric=params["eval_metric"],
-            verbosity=1 if self.verbose else 0,
-        )
-        self.model_.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=self.verbose,
+        self.booster_, self.best_iteration_ = _train(
+            X_train, y_train, X_val, y_val, params, self.verbose
         )
         self.classes_ = np.array([0, 1])
         return self
 
     def predict_proba(self, X):
         """Return class probabilities, shape (n_samples, 2)."""
-        check_is_fitted(self, "model_")
-        prob_pos = self.model_.predict_proba(X)[:, 1]
+        check_is_fitted(self, "booster_")
+        dtest = xgb.DMatrix(X)
+        prob_pos = self.booster_.predict(
+            dtest, iteration_range=(0, self.best_iteration_ + 1)
+        )
         return np.column_stack([1 - prob_pos, prob_pos])
 
     def predict(self, X):
         """Return binary predictions (0 or 1)."""
-        check_is_fitted(self, "model_")
-        return self.model_.predict(X)
+        return (self.predict_proba(X)[:, 1] > 0.5).astype(int)
 
     def to_onnx(self, path: str) -> None:
         """
@@ -114,8 +111,11 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         path : str
             Destination file path, e.g. ``"model.onnx"``.
         """
-        check_is_fitted(self, "model_")
-        _export_onnx(self.model_, path, self.profile_.n_features)
+        check_is_fitted(self, "booster_")
+        wrapper = _booster_to_sklearn_wrapper(
+            self.booster_, task="binary_classification"
+        )
+        _export_onnx(wrapper, path, self.profile_.n_features)
 
 
 class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
@@ -131,7 +131,14 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         "cpu" or "gpu".
     verbose : bool
         If True, print the chosen parameters before training and XGBoost's
-        training log.
+        per-round eval log.
+
+    Attributes (after .fit())
+    --------------------------
+    profile_ : DatasetProfile
+    params_ : dict
+    booster_ : xgb.Booster
+    best_iteration_ : int
     """
 
     def __init__(self, device: str = "cpu", verbose: bool = False):
@@ -139,18 +146,6 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         self.verbose = verbose
 
     def fit(self, X, y):
-        """
-        Profile X and y, select parameters, and train.
-
-        Parameters
-        ----------
-        X : array-like or scipy sparse, shape (n_samples, n_features)
-        y : array-like, shape (n_samples,)  — continuous target
-
-        Returns
-        -------
-        self
-        """
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="regression")
         params = _get_params(profile, device=self.device)
@@ -164,26 +159,18 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         X_train, X_val, y_train, y_val = _validation_split(
             X, y, profile, stratify=False
         )
-
-        xgb_params = {k: v for k, v in params.items()
-                      if k not in ("early_stopping_rounds", "eval_metric")}
-        self.model_ = xgb.XGBRegressor(
-            **xgb_params,
-            early_stopping_rounds=params["early_stopping_rounds"],
-            eval_metric=params["eval_metric"],
-            verbosity=1 if self.verbose else 0,
-        )
-        self.model_.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=self.verbose,
+        self.booster_, self.best_iteration_ = _train(
+            X_train, y_train, X_val, y_val, params, self.verbose
         )
         return self
 
     def predict(self, X):
         """Return continuous predictions."""
-        check_is_fitted(self, "model_")
-        return self.model_.predict(X)
+        check_is_fitted(self, "booster_")
+        dtest = xgb.DMatrix(X)
+        return self.booster_.predict(
+            dtest, iteration_range=(0, self.best_iteration_ + 1)
+        )
 
     def to_onnx(self, path: str) -> None:
         """
@@ -201,13 +188,67 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         path : str
             Destination file path, e.g. ``"model.onnx"``.
         """
-        check_is_fitted(self, "model_")
-        _export_onnx(self.model_, path, self.profile_.n_features)
+        check_is_fitted(self, "booster_")
+        wrapper = _booster_to_sklearn_wrapper(self.booster_, task="regression")
+        _export_onnx(wrapper, path, self.profile_.n_features)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _train(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
+    """
+    Build QuantileDMatrix pair and train via xgb.train().
+
+    The validation QuantileDMatrix is built with ref=dtrain so both sets
+    share identical quantile boundaries — no redundant computation.
+
+    Returns (booster, best_iteration).
+    """
+    max_bin = params.get("max_bin", 256)
+    num_boost_round = params["n_estimators"]
+    early_stopping_rounds = params["early_stopping_rounds"]
+
+    # Keys consumed here; not passed to xgb.train() params dict
+    _skip = {"n_estimators", "early_stopping_rounds"}
+    xgb_params = {k: v for k, v in params.items() if k not in _skip}
+
+    dtrain = xgb.QuantileDMatrix(X_train, label=y_train, max_bin=max_bin)
+    dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
+
+    booster = xgb.train(
+        xgb_params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dval, "val")],
+        early_stopping_rounds=early_stopping_rounds,
+        verbose_eval=verbose,
+    )
+    best_iter = booster.best_iteration
+    return booster, best_iter
+
+
+def _booster_to_sklearn_wrapper(booster: xgb.Booster, task: str):
+    """
+    Load a raw Booster into an sklearn wrapper for onnxmltools export.
+    Saves to a temp file and reloads via the sklearn API.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as f:
+        tmpfile = f.name
+    try:
+        booster.save_model(tmpfile)
+        if task == "binary_classification":
+            wrapper = xgb.XGBClassifier()
+            wrapper.load_model(tmpfile)
+            wrapper.n_classes_ = 2
+        else:
+            wrapper = xgb.XGBRegressor()
+            wrapper.load_model(tmpfile)
+    finally:
+        os.unlink(tmpfile)
+    return wrapper
+
 
 def _export_onnx(model, path: str, n_features: int) -> None:
     """Convert an XGBoost sklearn estimator to ONNX and write to path."""
@@ -230,19 +271,15 @@ def _export_onnx(model, path: str, n_features: int) -> None:
 def _validation_split(X, y, profile: DatasetProfile, stratify: bool):
     """
     Split off a small validation set for early stopping.
-    Falls back to a copy of the training set when n_samples is too small.
+    Falls back to reusing the full set when n_samples is very small.
     """
-    n = profile.n_samples
-    if n < _VAL_MIN_ROWS:
-        # Too few rows to split: reuse training data for eval (slight overfit
-        # is acceptable at this scale compared to losing training samples).
+    if profile.n_samples < _VAL_MIN_ROWS:
         return X, X, y, y
 
     strat = y if stratify else None
-    X_train, X_val, y_train, y_val = train_test_split(
+    return train_test_split(
         X, y,
         test_size=_VAL_FRACTION,
         random_state=_RANDOM_STATE,
         stratify=strat,
     )
-    return X_train, X_val, y_train, y_val
