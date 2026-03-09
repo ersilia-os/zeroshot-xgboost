@@ -3,18 +3,21 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "my-package"
+name = "zsxgboost"
 version = "0.1.0"
-description = "A short description of my package"
+description = "Reasonable zero-shot XGBoost configurations for high dimensional data"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
-  {name="Your Name", email="you@ersilia.io"}
+  {name="Miquel Duran-Frigola", email="miquel@ersilia.io"}
 ]
 requires-python = ">=3.10"
 
 dependencies = [
   "numpy>=1.21",
+  "scipy>=1.7",
+  "xgboost>=2.0",
+  "scikit-learn>=1.0",
 ]
 
 [project.optional-dependencies]
