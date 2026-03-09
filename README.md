@@ -127,7 +127,7 @@ preds = sess.run(None, {"float_input": X_test.astype(np.float32)})[0].ravel()
 | `binary_feature_fraction` > 0.8 | `max_depth` −1 (floor 3) |
 | `n_features` > 500 | `colsample_bytree` ≤ 0.5 |
 | Sparse count features | `reg_alpha` = 0.1, `max_depth` +1, `colsample_bytree` ×1.5, `max_bin` = 64 |
-| Imbalance ratio > 1.5 | `scale_pos_weight` = neg/pos |
+| Any imbalance | `scale_pos_weight` = neg/pos (always, equivalent to `class_weight="balanced"`) |
 | Imbalance ratio > 10 | `eval_metric` = `aucpr` |
 | Imbalance ratio > 100 | `max_delta_step` = 1 |
 | Regression \|skew\| < 1 | `objective` = `reg:squarederror` |

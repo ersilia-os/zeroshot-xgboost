@@ -280,10 +280,10 @@ def _set_classification_params(params: Dict[str, Any], profile: DatasetProfile) 
 
     ratio = profile.imbalance_ratio
 
-    # scale_pos_weight: XGBoost docs recommend neg/pos for imbalanced data.
-    # Only apply when ratio is meaningfully > 1.
-    if ratio > 1.5:
-        params["scale_pos_weight"] = round(ratio, 4)
+    # scale_pos_weight: equivalent to sklearn's class_weight="balanced".
+    # Always set it — when ratio=1 it is a no-op, and for any imbalance
+    # (even mild) it corrects the gradient contribution of each class.
+    params["scale_pos_weight"] = round(ratio, 4)
 
     # max_delta_step = 1 stabilises logistic regression gradient updates
     # when imbalance is extreme (XGBoost docs recommendation).
