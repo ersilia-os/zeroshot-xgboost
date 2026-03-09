@@ -5,7 +5,7 @@ Computes all statistics about X and y needed to choose hyperparameters
 without any search or cross-validation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -18,9 +18,14 @@ class DatasetProfile:
     n_samples: int
     n_features: int
 
+    # Sample-to-feature ratio (samples per feature)
+    n_p_ratio: float
+
     # Feature characteristics
     sparsity: float          # fraction of zeros in X (0.0–1.0)
     is_sparse_counts: bool   # True for fingerprint-like data (integer, sparse, small values)
+    binary_feature_fraction: float  # fraction of features that only take {0, 1} values
+    feature_signal_strength: float  # mean |Pearson corr| between features and target (sampled)
 
     # Task
     task: str                # "binary_classification" or "regression"
@@ -35,8 +40,10 @@ class DatasetProfile:
     def __repr__(self):
         lines = [
             f"DatasetProfile(",
-            f"  n_samples={self.n_samples}, n_features={self.n_features}",
+            f"  n_samples={self.n_samples}, n_features={self.n_features}, n_p_ratio={self.n_p_ratio:.2f}",
             f"  sparsity={self.sparsity:.3f}, is_sparse_counts={self.is_sparse_counts}",
+            f"  binary_feature_fraction={self.binary_feature_fraction:.3f}, "
+            f"feature_signal_strength={self.feature_signal_strength:.3f}",
             f"  task={self.task!r}",
         ]
         if self.task == "binary_classification":
@@ -84,6 +91,65 @@ def _detect_sparse_counts(X, sparsity: float) -> bool:
     return is_integer_like and max_val <= 10
 
 
+def _compute_binary_feature_fraction(X, n_sample: int = 5000) -> float:
+    """
+    Fraction of features that take only {0, 1} values (e.g. one-hot encoded
+    or binary indicator features).  Estimated from the first n_sample rows.
+    """
+    n_s = min(n_sample, X.shape[0])
+    if hasattr(X, "toarray"):
+        sample = X[:n_s].toarray()
+    else:
+        sample = np.asarray(X[:n_s])
+    is_binary = ((sample == 0) | (sample == 1)).all(axis=0)
+    return float(is_binary.mean())
+
+
+def _estimate_feature_signal(X, y: np.ndarray, n_sample: int = 5000,
+                              p_sample: int = 500) -> float:
+    """
+    Estimate mean absolute Pearson correlation between features and target.
+
+    Uses the first n_sample rows and a random subsample of p_sample columns.
+    Constant features are excluded.  Returns a value in [0, 1] — higher
+    means stronger average linear feature-target signal.
+
+    This is a cheap proxy: XGBoost exploits non-linear interactions, but the
+    mean |Pearson| still distinguishes genuine signal from pure noise and
+    scales predictably with dataset difficulty.
+    """
+    n, p = X.shape
+    n_s = min(n_sample, n)
+
+    if hasattr(X, "toarray"):
+        X_s = X[:n_s].toarray().astype(float)
+    else:
+        X_s = np.asarray(X[:n_s], dtype=float)
+    y_s = y[:n_s].astype(float)
+
+    # Subsample columns for speed
+    if p > p_sample:
+        rng = np.random.RandomState(42)
+        col_idx = rng.choice(p, p_sample, replace=False)
+        X_s = X_s[:, col_idx]
+
+    # Drop constant features; check for constant target
+    x_std = X_s.std(axis=0)
+    X_s = X_s[:, x_std > 0]
+    y_std = float(y_s.std())
+    if X_s.shape[1] == 0 or y_std == 0.0:
+        return 0.0
+
+    # Vectorized Pearson correlation of each feature with the target
+    X_c = X_s - X_s.mean(axis=0)      # (n_s, p_s)
+    y_c = y_s - y_s.mean()            # (n_s,)
+    cov = (X_c * y_c[:, None]).mean(axis=0)   # (p_s,)
+    x_stds = X_c.std(axis=0)
+    mask = x_stds > 0
+    corrs = np.abs(cov[mask] / (x_stds[mask] * y_std))
+    return float(np.clip(corrs, 0.0, 1.0).mean()) if corrs.size > 0 else 0.0
+
+
 def _detect_task(y: np.ndarray) -> str:
     """
     Auto-detects task from y.
@@ -121,6 +187,9 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
 
     sparsity = _compute_sparsity(X)
     is_sparse_counts = _detect_sparse_counts(X, sparsity)
+    binary_feature_fraction = _compute_binary_feature_fraction(X)
+    feature_signal_strength = _estimate_feature_signal(X, y)
+    n_p_ratio = float(n_samples) / n_features
 
     if task == "binary_classification":
         unique, counts = np.unique(y, return_counts=True)
@@ -134,8 +203,11 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
         return DatasetProfile(
             n_samples=n_samples,
             n_features=n_features,
+            n_p_ratio=n_p_ratio,
             sparsity=sparsity,
             is_sparse_counts=is_sparse_counts,
+            binary_feature_fraction=binary_feature_fraction,
+            feature_signal_strength=feature_signal_strength,
             task=task,
             imbalance_ratio=imbalance_ratio,
         )
@@ -146,8 +218,11 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
         return DatasetProfile(
             n_samples=n_samples,
             n_features=n_features,
+            n_p_ratio=n_p_ratio,
             sparsity=sparsity,
             is_sparse_counts=is_sparse_counts,
+            binary_feature_fraction=binary_feature_fraction,
+            feature_signal_strength=feature_signal_strength,
             task=task,
             y_skewness=y_skewness,
             y_all_positive=y_all_positive,

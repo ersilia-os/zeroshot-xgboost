@@ -4,11 +4,36 @@ Zero-shot XGBoost hyperparameter selection.
 All rules are derived from:
   - Friedman (2001) "Greedy Function Approximation: A Gradient Boosting Machine"
   - Chen & Guestrin (2016) XGBoost paper (arXiv:1603.02754)
-  - XGBoost official documentation
+  - XGBoost official documentation and parameter tuning notes
+  - Winkelmolen et al. (2020) "Practical and Sample Efficient Zero-Shot HPO"
+    (arXiv:2007.13382)
+  - Lima Marinho et al. (2024) "Optimization on selecting XGBoost hyperparameters
+    using meta-learning" (Expert Systems)
+  - Sommer et al. (2019) "Learning to Tune XGBoost with XGBoost"
+    (arXiv:1909.07218)
+  - Hutter et al. (2014) fANOVA hyperparameter importance analysis (ICML)
   - Community heuristics from Kaggle and AnalyticsVidhya
 
 No search, no cross-validation. Parameters are chosen purely from dataset
 statistics captured in a DatasetProfile.
+
+Key design decisions
+--------------------
+* early_stopping_rounds scales with 1/learning_rate so slower learners have
+  enough patience to reach their optimum (50 rounds at lr=0.1; 250 at lr=0.02).
+* The n/p ratio (samples per feature) drives max_depth and regularization:
+  underdetermined problems (n/p < 5) need shallower trees and stronger L1/L2
+  to avoid fitting noise.
+* gamma (min_split_loss) is set > 0 only when n/p < 5 — a regime where
+  post-split pruning provides measurable benefit beyond weight regularisation.
+* Binary-feature-rich inputs (one-hot style) get one depth level reduced,
+  since each binary split carries roughly half the information of a continuous
+  split.
+* Sparse count data (Morgan fingerprints etc.) uses max_bin=64; integer values
+  ≤ 10 are perfectly captured by 64 histogram bins, halving memory versus 128.
+* A small random forest component (num_parallel_tree=3) is injected for
+  datasets with n < 1000 to reduce variance via within-round bagging —
+  following XGBoost's own RF tutorial and practitioner guidance.
 """
 
 import os
@@ -63,16 +88,29 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # n_estimators and early stopping
     # Set a high ceiling; early stopping will find the optimal round.
-    # The caller must pass eval_set to .fit().
+    # early_stopping_rounds scales with 1/lr: slower learners need more
+    # patience before improvement plateaus.  Formula:
+    #   patience ≈ 50 × (0.1 / lr)
+    # giving 50 rounds at lr=0.1, 100 at lr=0.05, 250 at lr=0.02.
     # ------------------------------------------------------------------
     params["n_estimators"] = 1000
-    params["early_stopping_rounds"] = 50
+    params["early_stopping_rounds"] = max(
+        20, int(round(50 * (0.1 / params["learning_rate"])))
+    )
 
     # ------------------------------------------------------------------
     # max_depth
     # Larger datasets can support deeper trees without overfitting.
     # Sparse count data (fingerprints) benefits from +1 depth because
     # useful splits need to combine several mostly-zero features.
+    #
+    # n/p ratio cap: when the data is underdetermined (few samples per
+    # feature), deep trees trivially overfit — cap depth at 3 (n/p < 2)
+    # or 4 (n/p < 5) regardless of n.
+    #
+    # Binary features: one-hot / indicator inputs carry roughly half the
+    # information per split of continuous features; one fewer depth level
+    # gives similar expressiveness with less overfitting risk.
     # ------------------------------------------------------------------
     if n < 1_000:
         max_depth = 3
@@ -85,6 +123,16 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
 
     if profile.is_sparse_counts:
         max_depth = min(max_depth + 1, 8)
+
+    # n/p ratio cap (applied after sparse-counts bump)
+    if profile.n_p_ratio < 2:
+        max_depth = min(max_depth, 3)
+    elif profile.n_p_ratio < 5:
+        max_depth = min(max_depth, 4)
+
+    # Binary-feature-rich inputs: reduce depth by one (floor at 3)
+    if profile.binary_feature_fraction > 0.8:
+        max_depth = max(3, max_depth - 1)
 
     params["max_depth"] = max_depth
 
@@ -108,13 +156,26 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # subsample
     # Stochastic gradient boosting: Friedman showed that subsample in
-    # [0.3, 0.8] almost universally helps. Reduce further for very large
-    # datasets to save memory.
+    # [0.3, 0.8] almost universally helps.  For tiny datasets subsampling
+    # introduces more variance than it removes — use all rows instead.
+    # Reduce further for very large datasets to save memory.
     # ------------------------------------------------------------------
-    if n >= 1_000_000:
+    if n < 200:
+        params["subsample"] = 1.0
+    elif n >= 1_000_000:
         params["subsample"] = 0.6
     else:
         params["subsample"] = 0.8
+
+    # ------------------------------------------------------------------
+    # num_parallel_tree  (random-forest style within-round bagging)
+    # For small datasets, training a small forest at each boosting step
+    # reduces variance via bagging diversity without cross-validation.
+    # subsample < 1 (0.8, set above) ensures the parallel trees see
+    # different row subsets within each round.
+    # ------------------------------------------------------------------
+    if 200 <= n < 1_000:
+        params["num_parallel_tree"] = 3
 
     # ------------------------------------------------------------------
     # colsample_bytree
@@ -139,7 +200,7 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     params["colsample_bytree"] = round(cst, 2)
 
     # ------------------------------------------------------------------
-    # Regularization
+    # Regularization (base rules)
     # L1 (reg_alpha) is better for high-dimensional sparse data; it drives
     # uninformative leaf weights toward zero.
     # L2 (reg_lambda) is the XGBoost default and suits dense continuous data.
@@ -158,11 +219,41 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
         params["reg_alpha"] = max(params["reg_alpha"], 0.5)
 
     # ------------------------------------------------------------------
-    # max_bin (histogram granularity)
-    # Reducing max_bin halves histogram memory proportionally.
-    # Critical for datasets with many features or very many rows.
+    # n/p ratio regularization multiplier
+    # Underdetermined problems have many more model parameters than
+    # training constraints.  Scale up L2 and raise the L1 floor to
+    # prevent the model from fitting noise that correlates with y by
+    # chance.  Applied multiplicatively on top of the base rules above.
     # ------------------------------------------------------------------
-    if n > 1_000_000 or p > 500:
+    if profile.n_p_ratio < 2:
+        params["reg_lambda"] = round(params["reg_lambda"] * 2.0, 4)
+        params["reg_alpha"] = max(params["reg_alpha"], 0.5)
+    elif profile.n_p_ratio < 5:
+        params["reg_lambda"] = round(params["reg_lambda"] * 1.5, 4)
+        params["reg_alpha"] = max(params["reg_alpha"], 0.1)
+
+    # ------------------------------------------------------------------
+    # gamma (min_split_loss)
+    # Pre-pruning regularizer: a split is accepted only if it reduces the
+    # loss by at least gamma.  Most effective when the data is
+    # underdetermined (n/p < 5) and depthwise growth would otherwise
+    # produce many small-gain splits deep in the tree.
+    # For well-determined data, other regularization handles overfitting
+    # and gamma=0 (default) is preferable to avoid pruning real signal.
+    # ------------------------------------------------------------------
+    if profile.n_p_ratio < 5:
+        params["gamma"] = 0.1
+
+    # ------------------------------------------------------------------
+    # max_bin (histogram granularity)
+    # Sparse count features (integer values ≤ 10) are perfectly captured
+    # by 64 bins — using more is wasteful and slows histogram construction.
+    # For large or high-dimensional dense data, 128 balances accuracy and
+    # memory.  The default 256 is used otherwise.
+    # ------------------------------------------------------------------
+    if profile.is_sparse_counts:
+        params["max_bin"] = 64
+    elif n > 1_000_000 or p > 500:
         params["max_bin"] = 128
     else:
         params["max_bin"] = 256
