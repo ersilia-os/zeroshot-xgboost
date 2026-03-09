@@ -70,23 +70,6 @@ DatasetProfile(
 }
 ```
 
-## Low-level API
-
-If you only want the parameter dict and will handle model training yourself:
-
-```python
-from zsxgboost import inspect, get_params
-import xgboost as xgb
-
-profile = inspect(X, y, task="binary_classification")
-params = get_params(profile, device="cpu")
-
-model = xgb.XGBClassifier(**params)
-model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
-```
-
-`task` can be `"binary_classification"` or `"regression"`. If omitted, it is inferred from `y` (two unique 0/1 values → classification).
-
 ## GPU support
 
 ```python
