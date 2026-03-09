@@ -29,6 +29,7 @@ import xgboost as xgb
 
 from .inspector import inspect as _inspect, DatasetProfile
 from .params import get_params as _get_params
+from .utils.logging import logger
 
 
 _VAL_FRACTION = 0.1
@@ -62,21 +63,35 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         self.verbose = verbose
 
     def fit(self, X, y):
+        logger.set_verbosity(self.verbose)
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="binary_classification")
         params = _get_params(profile, device=self.device)
         self.profile_ = profile
         self.params_ = params
 
-        if self.verbose:
-            print(profile)
-            print("Selected parameters:", params)
+        logger.info(
+            f"Binary classification | n={profile.n_samples}, p={profile.n_features} | "
+            f"imbalance_ratio={profile.imbalance_ratio:.2f} | "
+            f"sparse_counts={profile.is_sparse_counts}"
+        )
+        logger.debug(
+            f"objective={params['objective']} | eval_metric={params['eval_metric']} | "
+            f"lr={params['learning_rate']} | max_depth={params['max_depth']} | "
+            f"colsample_bytree={params['colsample_bytree']}"
+        )
 
         X_train, X_val, y_train, y_val = _validation_split(
             X, y, profile, stratify=True
         )
+        logger.debug(
+            f"Train split: {len(y_train)} rows | Val split: {len(y_val)} rows"
+        )
         self.booster_, self.best_iteration_ = _train(
             X_train, y_train, X_val, y_val, params, self.verbose
+        )
+        logger.success(
+            f"Training complete | best_iteration={self.best_iteration_}"
         )
         self.classes_ = np.array([0, 1])
         return self
@@ -146,21 +161,35 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         self.verbose = verbose
 
     def fit(self, X, y):
+        logger.set_verbosity(self.verbose)
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="regression")
         params = _get_params(profile, device=self.device)
         self.profile_ = profile
         self.params_ = params
 
-        if self.verbose:
-            print(profile)
-            print("Selected parameters:", params)
+        logger.info(
+            f"Regression | n={profile.n_samples}, p={profile.n_features} | "
+            f"y_skewness={profile.y_skewness:.3f} | "
+            f"sparse_counts={profile.is_sparse_counts}"
+        )
+        logger.debug(
+            f"objective={params['objective']} | eval_metric={params['eval_metric']} | "
+            f"lr={params['learning_rate']} | max_depth={params['max_depth']} | "
+            f"colsample_bytree={params['colsample_bytree']}"
+        )
 
         X_train, X_val, y_train, y_val = _validation_split(
             X, y, profile, stratify=False
         )
+        logger.debug(
+            f"Train split: {len(y_train)} rows | Val split: {len(y_val)} rows"
+        )
         self.booster_, self.best_iteration_ = _train(
             X_train, y_train, X_val, y_val, params, self.verbose
+        )
+        logger.success(
+            f"Training complete | best_iteration={self.best_iteration_}"
         )
         return self
 
