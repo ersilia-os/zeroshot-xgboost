@@ -1,6 +1,6 @@
-# zsxgboost
+# Zero-shot XGBoost
 
-Zero-shot XGBoost configuration for binary classification and regression.
+Reasonable zero-shot XGBoost configuration for binary classification and regression.
 
 Given a dataset `(X, y)`, `zsxgboost` selects reasonable XGBoost hyperparameters automatically — no grid search, no cross-validation, no tuning. Parameters are derived entirely from dataset statistics: size, feature sparsity, class imbalance, and target distribution.
 
@@ -94,6 +94,38 @@ clf = ZeroShotXGBClassifier(device="gpu")
 ```
 
 Sets `device="cuda"` internally. Everything else is identical.
+
+## ONNX export
+
+Trained models can be exported to ONNX for deployment in any ONNX-compatible runtime.
+
+Install the optional dependencies first:
+
+```bash
+pip install zsxgboost[onnx]
+```
+
+Then export after fitting:
+
+```python
+clf.to_onnx("classifier.onnx")
+reg.to_onnx("regressor.onnx")
+```
+
+Run inference with `onnxruntime`:
+
+```python
+import onnxruntime as ort
+import numpy as np
+
+# Classifier: outputs label (int64) and probabilities (float32, n×2)
+sess = ort.InferenceSession("classifier.onnx")
+label, proba = sess.run(None, {"float_input": X_test.astype(np.float32)})
+
+# Regressor: outputs variable (float32, n×1)
+sess = ort.InferenceSession("regressor.onnx")
+preds = sess.run(None, {"float_input": X_test.astype(np.float32)})[0].ravel()
+```
 
 ## Parameter selection rules
 
