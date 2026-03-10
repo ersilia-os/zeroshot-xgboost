@@ -22,6 +22,14 @@ All rules are derived from:
     JCIM — found max_depth=4, lr=0.1 needed to match RF on ECFP features
   - AutoGluon tabular XGBoost search space (n_estimators=10000, lr 0.005-0.2,
     max_depth 3-10, colsample_bytree 0.5-1.0, min_child_weight 1-5)
+  - FLAML default (Wang et al. 2021, arXiv:2005.01571): meta-learned portfolio
+    of XGBoost configs selected by 1-NN in (n_samples, n_features, n_classes,
+    %numeric) space.  Key observations from the portfolio JSON files: all
+    configs use lr 0.001-0.04 (far below XGBoost's default 0.3); the
+    leaf-wise "xgboost" variant uses grow_policy="lossguide" + max_leaves
+    (not max_depth) to build asymmetric trees; colsample_bylevel appears in
+    every config; for high-p datasets the Amazon benchmark config
+    (p≈10k) selects lr=0.001, colsample_bylevel=1.0, colsample_bytree=0.45.
   - Community heuristics from Kaggle and AnalyticsVidhya
 
 No search, no cross-validation. Parameters are chosen purely from dataset
@@ -43,17 +51,22 @@ Key design decisions
   leaf effectively filters structural fragments that appear in fewer than that
   many training molecules, preventing the model from overfitting rare ECFP bits.
   Probst et al. 2023 recommends exploring 5-20 for fingerprint QSAR.
-* learning_rate is reduced to 0.05 for sparse-count small datasets (Probst et
-  al. 2023 found 0.01-0.05 consistently outperforms 0.1 for molecular property
-  prediction).
-* Binary-only features that are NOT sparse fingerprint data (pure one-hot style)
-  get one depth level reduced, since each binary split carries roughly half the
-  information of a continuous split.  ECFP fingerprints are exempt from this
-  reduction because they are already handled by the sparse-counts depth bump.
-* The n/p ratio depth cap is relaxed for sparse-count data: colsample_bynode,
-  min_child_weight, gamma, and L1 regularization together constrain capacity more
-  precisely than a hard depth cap.  Fingerprint data with n/p < 2 is allowed
-  max_depth=4 instead of 3 so the model can capture multi-bit interactions.
+* learning_rate is reduced to 0.02 for sparse-count small datasets.  FLAML's
+  entire portfolio uses 0.001-0.04; Probst et al. 2023 recommends 0.01-0.05
+  for molecular data.  The lower value (0.02 vs the previous 0.05) better
+  matches the FLAML posterior and is compensated by early stopping.
+* For sparse-count fingerprint data (ECFP/Morgan, p > 200), we use
+  grow_policy="lossguide" + max_leaves instead of max_depth.  Leaf-wise
+  growth (FLAML's "xgboost" portfolio variant) builds asymmetric trees that
+  descend deeper in the few discriminative bit paths while not wasting
+  capacity on the ~93% zero-valued bits.  max_leaves = max(16, min(128, n//50))
+  gives 16-128 leaves depending on dataset size, providing similar capacity to
+  a depth-4 symmetric tree (16 leaves) while allowing depth-unlimited
+  specialisation where the signal is.
+* For non-fingerprint data, depthwise growth is retained.  Binary-only features
+  that are NOT sparse fingerprint data (pure one-hot style) get one depth level
+  reduced, since each binary split carries roughly half the information of a
+  continuous split.  The n/p ratio further caps depth for underdetermined data.
 * Sparse count data (Morgan fingerprints etc.) uses max_bin=64; integer values
   ≤ 10 are perfectly captured by 64 histogram bins, halving memory versus 128.
 * A small random forest component (num_parallel_tree=3) is injected for
@@ -132,7 +145,7 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # spurious early trees.
     # ------------------------------------------------------------------
     if n < 10_000:
-        params["learning_rate"] = 0.05 if profile.is_sparse_counts else 0.1
+        params["learning_rate"] = 0.02 if profile.is_sparse_counts else 0.1
     elif n < 100_000:
         params["learning_rate"] = 0.05
     else:
@@ -154,51 +167,49 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     )
 
     # ------------------------------------------------------------------
-    # max_depth
-    # Larger datasets can support deeper trees without overfitting.
-    # Sparse count data (fingerprints) benefits from +1 depth because
-    # useful splits need to combine several mostly-zero features.
+    # Tree growth strategy
     #
-    # n/p ratio cap: when the data is underdetermined (few samples per
-    # feature), deep trees trivially overfit — cap depth at 3 (n/p < 2)
-    # or 4 (n/p < 5) regardless of n.
+    # Sparse-count fingerprint data (ECFP/Morgan, p > 200):
+    #   grow_policy="lossguide" + max_leaves  (FLAML "xgboost" variant)
+    #   Leaf-wise growth builds asymmetric trees that can go arbitrarily
+    #   deep along the few discriminative bit paths while ignoring the
+    #   ~93% zero-valued bits.  max_depth=0 disables the depth cap;
+    #   max_leaves controls total capacity instead.
+    #   max_leaves = max(16, min(128, n // 50)) gives:
+    #     n=500  → 16 leaves (conservative for very small datasets)
+    #     n=1600 → 32 leaves (~equivalent to a balanced depth-5 tree)
+    #     n=5000 → 100 leaves
+    #     n≥6400 → 128 leaves (ceiling)
     #
-    # Binary features: one-hot / indicator inputs carry roughly half the
-    # information per split of continuous features; one fewer depth level
-    # gives similar expressiveness with less overfitting risk.
+    # All other data: standard depthwise growth.
+    #   Larger datasets support deeper trees; n/p ratio and binary-feature
+    #   fraction further modulate depth.
     # ------------------------------------------------------------------
-    if n < 1_000:
-        max_depth = 3
-    elif n < 10_000:
-        max_depth = 4
-    elif n < 100_000:
-        max_depth = 5
+    if profile.is_sparse_counts and p > 200:
+        params["grow_policy"] = "lossguide"
+        params["max_depth"] = 0          # unlimited; max_leaves takes over
+        params["max_leaves"] = max(16, min(128, n // 50))
     else:
-        max_depth = 6
+        if n < 1_000:
+            max_depth = 3
+        elif n < 10_000:
+            max_depth = 4
+        elif n < 100_000:
+            max_depth = 5
+        else:
+            max_depth = 6
 
-    if profile.is_sparse_counts:
-        max_depth = min(max_depth + 1, 8)
+        # n/p ratio cap: underdetermined problems overfit with deep trees.
+        if profile.n_p_ratio < 2:
+            max_depth = min(max_depth, 3)
+        elif profile.n_p_ratio < 5:
+            max_depth = min(max_depth, 4)
 
-    # n/p ratio cap (applied after sparse-counts bump).
-    # For sparse-count (fingerprint) data, colsample_bynode + min_child_weight
-    # + gamma + L1 together constrain capacity more precisely than a hard depth
-    # cap; allowing one extra depth level lets the model capture multi-bit
-    # interactions (e.g. two rare ECFP bits co-occurring → active molecule).
-    if profile.n_p_ratio < 2:
-        max_depth = min(max_depth, 4 if profile.is_sparse_counts else 3)
-    elif profile.n_p_ratio < 5:
-        max_depth = min(max_depth, 5 if profile.is_sparse_counts else 4)
+        # Binary-feature-rich inputs (one-hot style): reduce depth by one.
+        if profile.binary_feature_fraction > 0.8:
+            max_depth = max(3, max_depth - 1)
 
-    # Binary-feature-rich inputs: reduce depth by one (floor at 3).
-    # EXEMPTION: sparse count data (ECFP / Morgan fingerprints) already
-    # received a depth bump above that accounts for the low per-feature
-    # information density.  Applying the binary penalty on top would cancel
-    # that bump and leave fingerprint data with the same depth as dense
-    # continuous data — the opposite of what we want.
-    if profile.binary_feature_fraction > 0.8 and not profile.is_sparse_counts:
-        max_depth = max(3, max_depth - 1)
-
-    params["max_depth"] = max_depth
+        params["max_depth"] = max_depth
 
     # ------------------------------------------------------------------
     # min_child_weight

@@ -263,10 +263,15 @@ class TestParams:
         p_dense = inspect(X_dense_bin, y_dense)
         assert p_ecfp.is_sparse_counts is True
         assert p_dense.is_sparse_counts is False
-        d_ecfp = get_params(p_ecfp)["max_depth"]
+        params_ecfp = get_params(p_ecfp)
         d_dense = get_params(p_dense)["max_depth"]
-        # ECFP should have strictly greater depth than dense binary
-        assert d_ecfp > d_dense
+        # ECFP fingerprints use lossguide growth (max_depth=0, max_leaves set)
+        # which is strictly not penalized — confirm lossguide mode or deeper depth
+        if params_ecfp.get("grow_policy") == "lossguide":
+            assert params_ecfp["max_depth"] == 0
+            assert "max_leaves" in params_ecfp
+        else:
+            assert params_ecfp["max_depth"] > d_dense
 
     def test_colsample_bytree_floor_for_sparse_counts(self):
         # ECFP fingerprints should have colsample_bytree >= 0.6
