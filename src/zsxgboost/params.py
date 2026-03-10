@@ -313,19 +313,14 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
         csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5))), 3)
         params["colsample_bynode"] = csn
 
-    # ------------------------------------------------------------------
-    # colsample_bylevel  (per-depth-level column sampling)
-    # Stacks multiplicatively with colsample_bynode to add an intermediate
-    # layer of diversity: the candidate pool for each depth level is first
-    # drawn from colsample_bytree, then restricted further by bylevel, then
-    # resampled per node via bynode.  For fingerprint data this gives a
-    # three-tier sampling that mirrors the extreme randomization of
-    # Extra-Trees and has been found to improve AUC on high-dimensional
-    # binary datasets (benchmarks vs LightGBM on Towards Data Science).
-    # Only applied alongside colsample_bynode (fingerprint-like data).
-    # ------------------------------------------------------------------
-    if "colsample_bynode" in params:
-        params["colsample_bylevel"] = 0.7
+    # Note: colsample_bylevel is intentionally NOT set when colsample_bynode
+    # is active.  All three colsample parameters multiply together:
+    #   effective_features = p * bytree * bylevel * bynode
+    # colsample_bynode is already calibrated so that
+    #   p * bytree * bynode ≈ sqrt(p)  (RF per-split target).
+    # Adding bylevel=0.7 would push effective features to only 0.7×sqrt(p),
+    # undershooting the RF target.  bylevel also has no clear meaning
+    # in lossguide (leaf-wise) growth mode, which is not level-wise.
 
     # ------------------------------------------------------------------
     # Regularization (base rules)
