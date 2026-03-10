@@ -212,11 +212,17 @@ class TestParams:
         assert params["max_depth"] <= 4
 
     def test_max_depth_reduced_for_binary_features(self):
+        # Use clearly dense binary data to exercise the one-hot penalty.
+        # Density = 0.7 → sparsity ~0.3 < 0.5, so is_sparse_counts=False.
+        # This represents dense one-hot or indicator features, not fingerprints.
         rng = np.random.RandomState(3)
-        X_bin = (rng.random((5000, 100)) < 0.3).astype(float)
+        X_bin = (rng.random((5000, 100)) < 0.7).astype(float)  # ~70% ones → not sparse_counts
         X_cont = rng.randn(5000, 100)
-        y = (X_bin.sum(axis=1) > 15).astype(int)
-        d_bin = get_params(inspect(X_bin, y))["max_depth"]
+        y = (X_bin.sum(axis=1) > 40).astype(int)
+        prof_bin = inspect(X_bin, y)
+        assert prof_bin.binary_feature_fraction > 0.8
+        assert prof_bin.is_sparse_counts is False  # ensures exemption does NOT fire
+        d_bin = get_params(prof_bin)["max_depth"]
         d_cont = get_params(inspect(X_cont, y))["max_depth"]
         assert d_bin <= d_cont
 
@@ -237,6 +243,48 @@ class TestParams:
         X, y = make_fingerprint_data()
         params = get_params(inspect(X, y))
         assert params["reg_alpha"] > 0.0
+
+    def test_reg_alpha_strong_for_underdetermined_fingerprints(self):
+        # n/p = 1000/1024 ≈ 1.0 → underdetermined ECFP: expect reg_alpha >= 1.0
+        X, y = make_fingerprint_data(n=1000, p=1024, density=0.05)
+        params = get_params(inspect(X, y))
+        assert params["reg_alpha"] >= 1.0
+
+    def test_max_depth_not_penalized_for_ecfp(self):
+        # ECFP is binary AND sparse-count: should get depth bump, not reduction.
+        # Compare against clearly dense binary (density=0.7, sparsity=0.3)
+        # which IS subject to the one-hot penalty.
+        rng = np.random.RandomState(5)
+        X_ecfp, y_ecfp = make_fingerprint_data(n=5000, p=512, density=0.05)
+        # Dense binary (one-hot style, ~70% density → sparsity=0.3 → not sparse_counts):
+        X_dense_bin = (rng.random((5000, 512)) < 0.7).astype(float)
+        y_dense = (X_dense_bin.sum(axis=1) > 180).astype(int)
+        p_ecfp = inspect(X_ecfp, y_ecfp)
+        p_dense = inspect(X_dense_bin, y_dense)
+        assert p_ecfp.is_sparse_counts is True
+        assert p_dense.is_sparse_counts is False
+        d_ecfp = get_params(p_ecfp)["max_depth"]
+        d_dense = get_params(p_dense)["max_depth"]
+        # ECFP should have strictly greater depth than dense binary
+        assert d_ecfp > d_dense
+
+    def test_colsample_bytree_floor_for_sparse_counts(self):
+        # ECFP fingerprints should have colsample_bytree >= 0.6
+        X, y = make_fingerprint_data(n=1000, p=2048, density=0.05)
+        params = get_params(inspect(X, y))
+        assert params["colsample_bytree"] >= 0.6
+
+    def test_colsample_bynode_set_for_ecfp(self):
+        # ECFP fingerprints (p > 200, is_sparse_counts) should get colsample_bynode
+        X, y = make_fingerprint_data(n=1000, p=1024, density=0.05)
+        params = get_params(inspect(X, y))
+        assert "colsample_bynode" in params
+        assert 0.05 <= params["colsample_bynode"] <= 0.3
+
+    def test_colsample_bynode_not_set_for_low_dim(self):
+        # Low-dimensional data (p <= 200) should not get colsample_bynode
+        params = get_params(self._prof(1000, 100))
+        assert "colsample_bynode" not in params
 
     # --- gamma ---
 
@@ -268,6 +316,11 @@ class TestParams:
 
     def test_num_parallel_tree_for_small_n(self):
         params = get_params(self._prof(500, 20))
+        assert params.get("num_parallel_tree", 1) == 3
+
+    def test_num_parallel_tree_extended_to_n2000(self):
+        # Range extended from n<1000 to n<2000 to cover typical drug dataset sizes.
+        params = get_params(self._prof(1500, 20))
         assert params.get("num_parallel_tree", 1) == 3
 
     def test_no_parallel_tree_for_large_n(self):
