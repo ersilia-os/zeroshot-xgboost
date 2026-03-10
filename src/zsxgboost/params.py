@@ -268,12 +268,17 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # colsample_bytree
     # Scales down with feature count to reduce variance and memory.
-    # For sparse count features (ECFP), the tree-level sampling must not
-    # be set too low because colsample_bynode will further restrict the
-    # per-split candidate pool; a floor of 0.6 ensures the combined
-    # sampling does not starve individual splits.
+    # For sparse-count fingerprint data (is_sparse_counts), colsample_bytree
+    # is set to 1.0 so that colsample_bynode can sample independently from
+    # ALL p features at every split — exactly mirroring Random Forest.
+    # If bytree < 1, a fixed subset of features is excluded from all splits
+    # in a tree, breaking the "any feature can appear at any split" guarantee
+    # that makes RF effective on high-dimensional binary data.
+    # For other data, tree-level subsampling reduces variance and memory.
     # ------------------------------------------------------------------
-    if p <= 50:
+    if profile.is_sparse_counts:
+        cst = 1.0
+    elif p <= 50:
         cst = 1.0
     elif p <= 200:
         cst = 0.8
@@ -284,33 +289,36 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     else:
         cst = max(0.3, 500 / p)
 
-    if profile.is_sparse_counts:
-        # For ECFP fingerprints, colsample_bynode already provides per-split
-        # diversity; colsample_bytree should stay reasonably high (>= 0.6)
-        # so that the tree-level pool is not too narrow.
-        cst = max(0.6, cst)
-
     params["colsample_bytree"] = round(cst, 2)
 
     # ------------------------------------------------------------------
     # colsample_bynode  (per-split column sampling)
     # For high-dimensional binary / sparse data (e.g. ECFP fingerprints),
-    # sampling columns at each split — rather than only per tree — injects
-    # the same per-node diversity that makes Random Forests strong on these
-    # inputs.  The fraction mirrors RF's sqrt(p)/p rule:
-    #   csn = sqrt(p) / p = 1 / sqrt(p)
-    # Examples: p=512 → 0.044, p=1024 → 0.031, p=2048 → 0.022.
-    # We clamp to [0.05, 0.3]:
-    #   - Lower bound 0.05: at p=1024, 0.05×1024 = ~51 features per split,
-    #     comparable to RF's sqrt(1024) = 32.  Going below this risks
-    #     too few meaningful features appearing at any split.
-    #   - Upper bound 0.3: keeps per-node diversity meaningful; beyond 0.3
-    #     the effect converges to colsample_bytree alone.
-    # Only applied when p > 200 and the data is binary/sparse-count, where
-    # the benefit is empirically largest.
+    # sampling columns at each split injects the same per-node diversity
+    # that makes Random Forests strong on these inputs.
+    #
+    # For is_sparse_counts data: colsample_bytree=1.0 above, so the
+    # effective features per split = p × 1.0 × csn = p × (1/sqrt(p)) = sqrt(p).
+    # This is exactly RF's sqrt(p)-features-per-split rule with every feature
+    # eligible at every node.
+    # Formula: csn = sqrt(p) / p = 1 / sqrt(p), clamped to [0.05, 0.3].
+    #   p=512  → 0.044 → clamped to 0.05  → 26 features (RF: 23)
+    #   p=1024 → 0.031 → clamped to 0.05  → 51 features (RF: 32)
+    #   p=2048 → 0.022 → clamped to 0.05  → 102 features (RF: 45)
+    # The lower bound 0.05 is conservative for p≤400; it keeps at least
+    # sqrt(p) features available even if the floor is hit.
+    #
+    # For dense binary data (not sparse_counts, bytree < 1):
+    # effective = p × bytree × csn, so csn is calibrated against the
+    # already-reduced bytree pool; the formula still targets sqrt(p) total.
     # ------------------------------------------------------------------
     if p > 200 and (profile.binary_feature_fraction > 0.8 or profile.is_sparse_counts):
-        csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5))), 3)
+        if profile.is_sparse_counts:
+            # bytree=1.0: csn directly gives effective features per split
+            csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5))), 3)
+        else:
+            # bytree < 1: compensate so bytree × csn ≈ sqrt(p)/p
+            csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5 * cst))), 3)
         params["colsample_bynode"] = csn
 
     # Note: colsample_bylevel is intentionally NOT set when colsample_bynode
