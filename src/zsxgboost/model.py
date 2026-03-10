@@ -81,14 +81,16 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
             f"colsample_bytree={params['colsample_bytree']}"
         )
 
-        X_train, X_val, y_train, y_val = _validation_split(
+        X_train, X_val, y_train, y_val, did_split = _validation_split(
             X, y, profile, stratify=True
         )
         logger.debug(
             f"Train split: {len(y_train)} rows | Val split: {len(y_val)} rows"
         )
         self.booster_, self.best_iteration_ = _train(
-            X_train, y_train, X_val, y_val, params, self.verbose
+            X_train, y_train, X_val, y_val, params, self.verbose,
+            X_full=X if did_split else None,
+            y_full=y if did_split else None,
         )
         logger.success(
             f"Training complete | best_iteration={self.best_iteration_}"
@@ -179,14 +181,16 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
             f"colsample_bytree={params['colsample_bytree']}"
         )
 
-        X_train, X_val, y_train, y_val = _validation_split(
+        X_train, X_val, y_train, y_val, did_split = _validation_split(
             X, y, profile, stratify=False
         )
         logger.debug(
             f"Train split: {len(y_train)} rows | Val split: {len(y_val)} rows"
         )
         self.booster_, self.best_iteration_ = _train(
-            X_train, y_train, X_val, y_val, params, self.verbose
+            X_train, y_train, X_val, y_val, params, self.verbose,
+            X_full=X if did_split else None,
+            y_full=y if did_split else None,
         )
         logger.success(
             f"Training complete | best_iteration={self.best_iteration_}"
@@ -226,12 +230,19 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _train(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
+def _train(X_train, y_train, X_val, y_val, params: dict, verbose: bool,
+           X_full=None, y_full=None):
     """
-    Build QuantileDMatrix pair and train via xgb.train().
+    Two-phase training to avoid discarding the validation split.
 
-    The validation QuantileDMatrix is built with ref=dtrain so both sets
-    share identical quantile boundaries — no redundant computation.
+    Phase 1: train on X_train/y_train with early stopping against X_val/y_val
+             to find best_iteration.
+    Phase 2: retrain on the full dataset (X_full/y_full, which is X_train+X_val
+             if provided) for exactly best_iteration rounds with no early stopping.
+
+    The final booster therefore sees 100% of the data at the round count
+    calibrated on 90%.  When X_full is None (e.g. the dataset was too small
+    to split), only Phase 1 runs.
 
     Returns (booster, best_iteration).
     """
@@ -246,6 +257,7 @@ def _train(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
     dtrain = xgb.QuantileDMatrix(X_train, label=y_train, max_bin=max_bin)
     dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
 
+    # Phase 1: find best_iteration via early stopping
     booster = xgb.train(
         xgb_params,
         dtrain,
@@ -255,6 +267,17 @@ def _train(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
         verbose_eval=verbose,
     )
     best_iter = booster.best_iteration
+
+    # Phase 2: retrain on full data for best_iter rounds (no early stopping)
+    if X_full is not None and best_iter > 0:
+        dfull = xgb.QuantileDMatrix(X_full, label=y_full, max_bin=max_bin)
+        booster = xgb.train(
+            xgb_params,
+            dfull,
+            num_boost_round=best_iter + 1,
+            verbose_eval=False,
+        )
+
     return booster, best_iter
 
 
@@ -301,14 +324,18 @@ def _validation_split(X, y, profile: DatasetProfile, stratify: bool):
     """
     Split off a small validation set for early stopping.
     Falls back to reusing the full set when n_samples is very small.
+
+    Returns (X_train, X_val, y_train, y_val, did_split).
+    did_split=False means the dataset was too small to split; train==full.
     """
     if profile.n_samples < _VAL_MIN_ROWS:
-        return X, X, y, y
+        return X, X, y, y, False
 
     strat = y if stratify else None
-    return train_test_split(
+    X_train, X_val, y_train, y_val = train_test_split(
         X, y,
         test_size=_VAL_FRACTION,
         random_state=_RANDOM_STATE,
         stratify=strat,
     )
+    return X_train, X_val, y_train, y_val, True
