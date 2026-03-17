@@ -71,8 +71,8 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         If True, log chosen parameters and winning preset name.
     portfolio : bool
         If True (default), train all five preset configurations on a validation
-        split and select the best.  If False, use the internal zero-shot preset
-        only (faster; useful as a baseline or when n is very small).
+        split and select the best.  If False, use the XGBoost default preset
+        only (faster; useful as a no-tuning baseline).
 
     Attributes (after .fit())
     --------------------------
@@ -121,11 +121,11 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
                 self.params_ = best_params
                 self.portfolio_scores_ = scores
             else:
-                best_params = _get_params(profile, device=self.device)
+                best_params = xgb_default_params(profile, device=self.device)
                 _, best_iter, _ = _train_phase1(
                     X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
                 )
-                self.preset_name_ = "internal"
+                self.preset_name_ = "default"
                 self.params_ = best_params
                 self.portfolio_scores_ = {}
             logger.debug(
@@ -136,10 +136,10 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
             )
             final_booster = _train_phase2(X, y, best_params, best_iter)
         else:
-            # Dataset too small to split: use internal preset only
-            params = _get_params(profile, device=self.device)
+            # Dataset too small to split: use default preset
+            params = xgb_default_params(profile, device=self.device)
             self.params_ = params
-            self.preset_name_ = "internal"
+            self.preset_name_ = "default"
             self.portfolio_scores_ = {}
             final_booster, best_iter, _ = _train_phase1(
                 X, y, X, y, params, verbose=self.verbose
@@ -207,8 +207,8 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         If True, log chosen parameters and winning preset name.
     portfolio : bool
         If True (default), train all five preset configurations on a validation
-        split and select the best.  If False, use the internal zero-shot preset
-        only (faster; useful as a baseline or when n is very small).
+        split and select the best.  If False, use the XGBoost default preset
+        only (faster; useful as a no-tuning baseline).
 
     Attributes (after .fit())
     --------------------------
@@ -254,11 +254,11 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
                 self.params_ = best_params
                 self.portfolio_scores_ = scores
             else:
-                best_params = _get_params(profile, device=self.device)
+                best_params = xgb_default_params(profile, device=self.device)
                 _, best_iter, _ = _train_phase1(
                     X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
                 )
-                self.preset_name_ = "internal"
+                self.preset_name_ = "default"
                 self.params_ = best_params
                 self.portfolio_scores_ = {}
             logger.debug(
@@ -269,9 +269,9 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
             )
             final_booster = _train_phase2(X, y, best_params, best_iter)
         else:
-            params = _get_params(profile, device=self.device)
+            params = xgb_default_params(profile, device=self.device)
             self.params_ = params
-            self.preset_name_ = "internal"
+            self.preset_name_ = "default"
             self.portfolio_scores_ = {}
             final_booster, best_iter, _ = _train_phase1(
                 X, y, X, y, params, verbose=self.verbose
