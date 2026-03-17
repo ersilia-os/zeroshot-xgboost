@@ -58,6 +58,11 @@ _RANDOM_STATE    = 42
 # Keys that guide training but are not native XGBoost parameters
 _META_KEYS = frozenset({"n_estimators", "early_stopping_rounds"})
 
+# Minimum validation-score gain over the 'default' preset required before
+# switching to a different preset.  Guards against selection noise on small
+# validation splits where AUC differences are within random fluctuation.
+_PORTFOLIO_MIN_GAIN = 0.005
+
 
 class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -381,6 +386,11 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
     scores_dict maps preset name → comparable validation score
     (higher is always better; minimisation metrics are negated).
 
+    A preset only wins over 'default' if it exceeds the default score by at
+    least _PORTFOLIO_MIN_GAIN.  This guards against selection noise on small
+    validation splits where differences between presets are within random
+    fluctuation.
+
     All presets use verbose=False during portfolio comparison; only the
     winning preset name and score are logged at INFO level.
     """
@@ -392,11 +402,14 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
         ("rf",        rf_params(profile, device)),
     ]
 
-    scores     = {}
-    best_score = float("-inf")
-    best_name  = None
+    scores      = {}
+    best_score  = float("-inf")
+    best_name   = None
     best_params = None
     best_iter   = 0
+    default_score  = float("-inf")
+    default_params = None
+    default_iter   = 0
 
     for name, params in candidates:
         try:
@@ -407,6 +420,10 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
             logger.debug(
                 f"[portfolio] {name:10s}: score={score:+.4f}  iter={b_iter}"
             )
+            if name == "default":
+                default_score  = score
+                default_params = params
+                default_iter   = b_iter
             if score > best_score:
                 best_score  = score
                 best_name   = name
@@ -417,15 +434,28 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
             scores[name] = float("nan")
 
     if best_name is None:
-        # All presets failed (extremely unusual) — fall back to internal
-        logger.debug("[portfolio] all presets failed; using internal preset")
-        params = _get_params(profile, device)
+        # All presets failed (extremely unusual) — fall back to default
+        logger.debug("[portfolio] all presets failed; using default preset")
+        params = xgb_default_params(profile, device)
         _, best_iter, best_score = _train_phase1(
             X_train, y_train, X_val, y_val, params, verbose=False
         )
-        best_name   = "internal"
+        best_name   = "default"
         best_params = params
-        scores["internal"] = best_score
+        scores["default"] = best_score
+    elif (best_name != "default"
+          and default_params is not None
+          and best_score - default_score < _PORTFOLIO_MIN_GAIN):
+        # The best preset does not convincingly beat the default — fall back
+        # to default to avoid propagating selection noise to the final model.
+        logger.debug(
+            f"[portfolio] {best_name} gain={best_score - default_score:+.4f} "
+            f"< threshold={_PORTFOLIO_MIN_GAIN}; reverting to default"
+        )
+        best_name   = "default"
+        best_params = default_params
+        best_iter   = default_iter
+        best_score  = default_score
 
     logger.info(
         f"Portfolio winner: {best_name}  (val_score={best_score:+.4f})"
