@@ -105,11 +105,12 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         )
 
         if did_split:
-            best_name, best_params, best_iter = _portfolio_select(
+            best_name, best_params, best_iter, scores = _portfolio_select(
                 X_train, y_train, X_val, y_val, profile, self.device
             )
             self.preset_name_ = best_name
             self.params_ = best_params
+            self.portfolio_scores_ = scores
             logger.debug(
                 f"objective={best_params['objective']} | "
                 f"eval_metric={best_params['eval_metric']} | "
@@ -122,6 +123,7 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
             params = _get_params(profile, device=self.device)
             self.params_ = params
             self.preset_name_ = "internal"
+            self.portfolio_scores_ = {}
             final_booster, best_iter, _ = _train_phase1(
                 X, y, X, y, params, verbose=self.verbose
             )
@@ -220,11 +222,12 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         )
 
         if did_split:
-            best_name, best_params, best_iter = _portfolio_select(
+            best_name, best_params, best_iter, scores = _portfolio_select(
                 X_train, y_train, X_val, y_val, profile, self.device
             )
             self.preset_name_ = best_name
             self.params_ = best_params
+            self.portfolio_scores_ = scores
             logger.debug(
                 f"objective={best_params['objective']} | "
                 f"eval_metric={best_params['eval_metric']} | "
@@ -236,6 +239,7 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
             params = _get_params(profile, device=self.device)
             self.params_ = params
             self.preset_name_ = "internal"
+            self.portfolio_scores_ = {}
             final_booster, best_iter, _ = _train_phase1(
                 X, y, X, y, params, verbose=self.verbose
             )
@@ -339,7 +343,10 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
                       profile: DatasetProfile, device: str):
     """
     Train all five presets on (X_train, X_val) with early stopping.
-    Return (best_preset_name, best_params, best_iteration).
+    Return (best_preset_name, best_params, best_iteration, scores_dict).
+
+    scores_dict maps preset name → comparable validation score
+    (higher is always better; minimisation metrics are negated).
 
     All presets use verbose=False during portfolio comparison; only the
     winning preset name and score are logged at INFO level.
@@ -352,6 +359,7 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
         ("rf",        rf_params(profile, device)),
     ]
 
+    scores     = {}
     best_score = float("-inf")
     best_name  = None
     best_params = None
@@ -362,6 +370,7 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
             _, b_iter, score = _train_phase1(
                 X_train, y_train, X_val, y_val, params, verbose=False
             )
+            scores[name] = score
             logger.debug(
                 f"[portfolio] {name:10s}: score={score:+.4f}  iter={b_iter}"
             )
@@ -372,6 +381,7 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
                 best_iter   = b_iter
         except Exception as exc:
             logger.debug(f"[portfolio] {name} failed: {exc}")
+            scores[name] = float("nan")
 
     if best_name is None:
         # All presets failed (extremely unusual) — fall back to internal
@@ -382,11 +392,12 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
         )
         best_name   = "internal"
         best_params = params
+        scores["internal"] = best_score
 
     logger.info(
         f"Portfolio winner: {best_name}  (val_score={best_score:+.4f})"
     )
-    return best_name, best_params, best_iter
+    return best_name, best_params, best_iter, scores
 
 
 def _booster_to_sklearn_wrapper(booster: xgb.Booster, task: str):
