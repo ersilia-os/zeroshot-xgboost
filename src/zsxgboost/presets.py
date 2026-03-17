@@ -80,7 +80,7 @@ def xgb_default_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
         "reg_lambda": 1.0,          # XGBoost default
         "max_bin": 256,
         "n_estimators": 2000,
-        "early_stopping_rounds": 20,   # patience ≈ 50 × (0.1 / 0.3) ≈ 17
+        "early_stopping_rounds": 50,
     }
     _add_task_params(params, profile)
     return params
