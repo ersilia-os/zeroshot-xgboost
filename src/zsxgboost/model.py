@@ -69,6 +69,10 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         "cpu" or "gpu".
     verbose : bool
         If True, log chosen parameters and winning preset name.
+    portfolio : bool
+        If True (default), train all five preset configurations on a validation
+        split and select the best.  If False, use the internal zero-shot preset
+        only (faster; useful as a baseline or when n is very small).
 
     Attributes (after .fit())
     --------------------------
@@ -76,14 +80,18 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     params_ : dict        — hyperparameters of the winning preset
     preset_name_ : str    — which of the 5 presets won ("internal", "default",
                             "flaml", "autogluon", or "rf")
+    portfolio_scores_ : dict — val scores for every preset (empty when
+                               portfolio=False or dataset too small to split)
     booster_ : xgb.Booster
     best_iteration_ : int
     classes_ : ndarray
     """
 
-    def __init__(self, device: str = "cpu", verbose: bool = False):
+    def __init__(self, device: str = "cpu", verbose: bool = False,
+                 portfolio: bool = True):
         self.device = device
         self.verbose = verbose
+        self.portfolio = portfolio
 
     def fit(self, X, y):
         logger.set_verbosity(self.verbose)
@@ -105,12 +113,21 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         )
 
         if did_split:
-            best_name, best_params, best_iter, scores = _portfolio_select(
-                X_train, y_train, X_val, y_val, profile, self.device
-            )
-            self.preset_name_ = best_name
-            self.params_ = best_params
-            self.portfolio_scores_ = scores
+            if self.portfolio:
+                best_name, best_params, best_iter, scores = _portfolio_select(
+                    X_train, y_train, X_val, y_val, profile, self.device
+                )
+                self.preset_name_ = best_name
+                self.params_ = best_params
+                self.portfolio_scores_ = scores
+            else:
+                best_params = _get_params(profile, device=self.device)
+                _, best_iter, _ = _train_phase1(
+                    X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
+                )
+                self.preset_name_ = "internal"
+                self.params_ = best_params
+                self.portfolio_scores_ = {}
             logger.debug(
                 f"objective={best_params['objective']} | "
                 f"eval_metric={best_params['eval_metric']} | "
@@ -188,19 +205,26 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         "cpu" or "gpu".
     verbose : bool
         If True, log chosen parameters and winning preset name.
+    portfolio : bool
+        If True (default), train all five preset configurations on a validation
+        split and select the best.  If False, use the internal zero-shot preset
+        only (faster; useful as a baseline or when n is very small).
 
     Attributes (after .fit())
     --------------------------
     profile_ : DatasetProfile
     params_ : dict
     preset_name_ : str
+    portfolio_scores_ : dict
     booster_ : xgb.Booster
     best_iteration_ : int
     """
 
-    def __init__(self, device: str = "cpu", verbose: bool = False):
+    def __init__(self, device: str = "cpu", verbose: bool = False,
+                 portfolio: bool = True):
         self.device = device
         self.verbose = verbose
+        self.portfolio = portfolio
 
     def fit(self, X, y):
         logger.set_verbosity(self.verbose)
@@ -222,12 +246,21 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         )
 
         if did_split:
-            best_name, best_params, best_iter, scores = _portfolio_select(
-                X_train, y_train, X_val, y_val, profile, self.device
-            )
-            self.preset_name_ = best_name
-            self.params_ = best_params
-            self.portfolio_scores_ = scores
+            if self.portfolio:
+                best_name, best_params, best_iter, scores = _portfolio_select(
+                    X_train, y_train, X_val, y_val, profile, self.device
+                )
+                self.preset_name_ = best_name
+                self.params_ = best_params
+                self.portfolio_scores_ = scores
+            else:
+                best_params = _get_params(profile, device=self.device)
+                _, best_iter, _ = _train_phase1(
+                    X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
+                )
+                self.preset_name_ = "internal"
+                self.params_ = best_params
+                self.portfolio_scores_ = {}
             logger.debug(
                 f"objective={best_params['objective']} | "
                 f"eval_metric={best_params['eval_metric']} | "
