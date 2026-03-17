@@ -481,12 +481,30 @@ class TestFitPredict:
         assert clf.params_["subsample"] == 1.0
 
     def test_high_dimensional_underdetermined(self):
+        # Portfolio selects among 5 presets; we check the model runs and
+        # exposes the expected attributes rather than pinning on one preset's
+        # exact max_depth/gamma values.
         X = RNG.randn(200, 500)
         y = (X[:, 0] > 0).astype(int)
         clf = ZeroShotXGBClassifier()
         clf.fit(X, y)
-        assert clf.params_["max_depth"] <= 3
-        assert clf.params_.get("gamma", 0) > 0
+        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf"}
+        assert clf.profile_.n_p_ratio < 1.0
+        preds = clf.predict(X)
+        assert set(preds).issubset({0, 1})
+
+    def test_preset_name_attribute(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf"}
+
+    def test_preset_name_tiny_dataset_is_internal(self):
+        # Tiny datasets skip portfolio selection; internal preset is used.
+        X, y = make_clf_data(n=150, p=10)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        assert clf.preset_name_ == "internal"
 
     def test_predict_before_fit_raises(self):
         clf = ZeroShotXGBClassifier()
