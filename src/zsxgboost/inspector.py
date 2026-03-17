@@ -26,6 +26,7 @@ class DatasetProfile:
     is_sparse_counts: bool   # True for fingerprint-like data (integer, sparse, small values)
     binary_feature_fraction: float  # fraction of features that only take {0, 1} values
     feature_signal_strength: float  # mean |Pearson corr| between features and target (sampled)
+    feature_signal_p90: float       # 90th-percentile |Pearson corr|; captures top-feature signal
 
     # Task
     task: str                # "binary_classification" or "regression"
@@ -50,6 +51,9 @@ class DatasetProfile:
             lines.append(f"  imbalance_ratio={self.imbalance_ratio:.2f}")
         else:
             lines.append(f"  y_skewness={self.y_skewness:.3f}, y_all_positive={self.y_all_positive}")
+        lines.append(
+            f"  feature_signal_p90={self.feature_signal_p90:.3f}"
+        )
         lines.append(")")
         return "\n".join(lines)
 
@@ -106,30 +110,34 @@ def _compute_binary_feature_fraction(X, n_sample: int = 5000) -> float:
 
 
 def _estimate_feature_signal(X, y: np.ndarray, n_sample: int = 5000,
-                              p_sample: int = 500) -> float:
+                              p_sample: int = 500):
     """
-    Estimate mean absolute Pearson correlation between features and target.
+    Estimate |Pearson| correlation distribution between features and target.
 
-    Uses the first n_sample rows and a random subsample of p_sample columns.
-    Constant features are excluded.  Returns a value in [0, 1] — higher
-    means stronger average linear feature-target signal.
+    Uses a random subsample of up to n_sample rows and p_sample columns.
+    Constant features are excluded.
 
-    This is a cheap proxy: XGBoost exploits non-linear interactions, but the
-    mean |Pearson| still distinguishes genuine signal from pure noise and
-    scales predictably with dataset difficulty.
+    Returns (mean_signal, p90_signal) where:
+    - mean_signal: mean |Pearson| across sampled features — overall noise level.
+    - p90_signal: 90th-percentile |Pearson| — captures the strength of the
+      top 10% of features, which matters more than the average when most
+      features are uninformative (e.g. ECFP fingerprints where ~93% of bits
+      are zero and only a handful drive the prediction).
     """
     n, p = X.shape
     n_s = min(n_sample, n)
+    rng = np.random.RandomState(42)
 
+    # Random row sampling (avoids bias from sorted/ordered datasets)
+    row_idx = rng.choice(n, n_s, replace=False) if n > n_s else np.arange(n_s)
     if hasattr(X, "toarray"):
-        X_s = X[:n_s].toarray().astype(float)
+        X_s = X[row_idx].toarray().astype(float)
     else:
-        X_s = np.asarray(X[:n_s], dtype=float)
-    y_s = y[:n_s].astype(float)
+        X_s = np.asarray(X)[row_idx].astype(float)
+    y_s = y[row_idx].astype(float)
 
-    # Subsample columns for speed
+    # Random column subsample for speed
     if p > p_sample:
-        rng = np.random.RandomState(42)
         col_idx = rng.choice(p, p_sample, replace=False)
         X_s = X_s[:, col_idx]
 
@@ -138,7 +146,7 @@ def _estimate_feature_signal(X, y: np.ndarray, n_sample: int = 5000,
     X_s = X_s[:, x_std > 0]
     y_std = float(y_s.std())
     if X_s.shape[1] == 0 or y_std == 0.0:
-        return 0.0
+        return 0.0, 0.0
 
     # Vectorized Pearson correlation of each feature with the target
     X_c = X_s - X_s.mean(axis=0)      # (n_s, p_s)
@@ -146,8 +154,10 @@ def _estimate_feature_signal(X, y: np.ndarray, n_sample: int = 5000,
     cov = (X_c * y_c[:, None]).mean(axis=0)   # (p_s,)
     x_stds = X_c.std(axis=0)
     mask = x_stds > 0
-    corrs = np.abs(cov[mask] / (x_stds[mask] * y_std))
-    return float(np.clip(corrs, 0.0, 1.0).mean()) if corrs.size > 0 else 0.0
+    corrs = np.clip(np.abs(cov[mask] / (x_stds[mask] * y_std)), 0.0, 1.0)
+    if corrs.size == 0:
+        return 0.0, 0.0
+    return float(corrs.mean()), float(np.percentile(corrs, 90))
 
 
 def _detect_task(y: np.ndarray) -> str:
@@ -188,7 +198,7 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
     sparsity = _compute_sparsity(X)
     is_sparse_counts = _detect_sparse_counts(X, sparsity)
     binary_feature_fraction = _compute_binary_feature_fraction(X)
-    feature_signal_strength = _estimate_feature_signal(X, y)
+    feature_signal_strength, feature_signal_p90 = _estimate_feature_signal(X, y)
     n_p_ratio = float(n_samples) / n_features
 
     if task == "binary_classification":
@@ -208,6 +218,7 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
             is_sparse_counts=is_sparse_counts,
             binary_feature_fraction=binary_feature_fraction,
             feature_signal_strength=feature_signal_strength,
+            feature_signal_p90=feature_signal_p90,
             task=task,
             imbalance_ratio=imbalance_ratio,
         )
@@ -223,6 +234,7 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
             is_sparse_counts=is_sparse_counts,
             binary_feature_fraction=binary_feature_fraction,
             feature_signal_strength=feature_signal_strength,
+            feature_signal_p90=feature_signal_p90,
             task=task,
             y_skewness=y_skewness,
             y_all_positive=y_all_positive,

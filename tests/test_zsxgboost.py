@@ -113,6 +113,8 @@ class TestInspector:
         X, y = make_clf_data(n=500, p=30)
         prof = inspect(X, y)
         assert 0.0 <= prof.feature_signal_strength <= 1.0
+        assert 0.0 <= prof.feature_signal_p90 <= 1.0
+        assert prof.feature_signal_p90 >= prof.feature_signal_strength
 
     def test_feature_signal_strength_noisy(self):
         rng = np.random.RandomState(7)
@@ -120,6 +122,7 @@ class TestInspector:
         y = rng.randint(0, 2, size=500)  # pure noise
         prof = inspect(X, y)
         assert prof.feature_signal_strength < 0.15
+        assert prof.feature_signal_p90 < 0.30
 
     def test_auto_task_detection_clf(self):
         X, y = make_clf_data()
@@ -150,6 +153,7 @@ class TestInspector:
         r = repr(prof)
         assert "n_p_ratio" in r
         assert "feature_signal_strength" in r
+        assert "feature_signal_p90" in r
         assert "binary_feature_fraction" in r
 
 
@@ -234,21 +238,24 @@ class TestParams:
         assert p_low["reg_lambda"] > p_high["reg_lambda"]
 
     def test_reg_alpha_nonzero_for_underdetermined(self):
+        # Dense data with n/p<2 gets non-zero alpha from the n<1000 floor.
         X = RNG.randn(100, 300)
         y = (X[:, 0] > 0).astype(int)
         params = get_params(inspect(X, y))
-        assert params["reg_alpha"] >= 0.5
+        assert params["reg_alpha"] > 0.0
 
     def test_reg_alpha_for_sparse_counts(self):
         X, y = make_fingerprint_data()
         params = get_params(inspect(X, y))
         assert params["reg_alpha"] > 0.0
 
-    def test_reg_alpha_strong_for_underdetermined_fingerprints(self):
-        # n/p = 1000/1024 ≈ 1.0 → underdetermined ECFP: expect reg_alpha >= 1.0
+    def test_reg_alpha_present_for_underdetermined_fingerprints(self):
+        # n/p ≈ 1.0 → underdetermined ECFP: reg_alpha should be set
+        # (but does not need to be >= 1.0; lighter values prevent the
+        # collapse that caused underfitting vs default RF).
         X, y = make_fingerprint_data(n=1000, p=1024, density=0.05)
         params = get_params(inspect(X, y))
-        assert params["reg_alpha"] >= 1.0
+        assert params["reg_alpha"] > 0.0
 
     def test_max_depth_not_penalized_for_ecfp(self):
         # ECFP is binary AND sparse-count: should get depth bump, not reduction.

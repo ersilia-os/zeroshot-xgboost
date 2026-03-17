@@ -34,6 +34,7 @@ from .utils.logging import logger
 
 _VAL_FRACTION = 0.1
 _VAL_MIN_ROWS = 200
+_VAL_MIN_MINORITY = 15   # minimum minority-class samples in the validation split
 _RANDOM_STATE = 42
 
 
@@ -325,16 +326,32 @@ def _validation_split(X, y, profile: DatasetProfile, stratify: bool):
     Split off a small validation set for early stopping.
     Falls back to reusing the full set when n_samples is very small.
 
+    For binary classification, the validation fraction is dynamically raised
+    when the minority class is small, ensuring at least _VAL_MIN_MINORITY
+    minority samples in the validation set.  With too few minority samples,
+    AUC estimates are noisy and early stopping can trigger at a suboptimal
+    round (e.g. HIA_Hou has ~62 minority samples in training; 10% val gives
+    only 6, making each rank-swap change AUC by ~0.017 — far too noisy).
+
     Returns (X_train, X_val, y_train, y_val, did_split).
     did_split=False means the dataset was too small to split; train==full.
     """
     if profile.n_samples < _VAL_MIN_ROWS:
         return X, X, y, y, False
 
+    val_fraction = _VAL_FRACTION
+    if stratify and profile.task == "binary_classification":
+        # Estimate minority count in the full fitting set from the profile.
+        ratio = profile.imbalance_ratio        # neg / pos
+        minority_count = int(profile.n_samples * min(ratio, 1.0) / (1.0 + ratio))
+        if minority_count > 0:
+            needed = _VAL_MIN_MINORITY / minority_count
+            val_fraction = max(_VAL_FRACTION, min(0.25, needed))
+
     strat = y if stratify else None
     X_train, X_val, y_train, y_val = train_test_split(
         X, y,
-        test_size=_VAL_FRACTION,
+        test_size=val_fraction,
         random_state=_RANDOM_STATE,
         stratify=strat,
     )

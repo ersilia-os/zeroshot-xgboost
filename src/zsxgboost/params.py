@@ -42,19 +42,22 @@ Key design decisions
 * The n/p ratio (samples per feature) drives max_depth and regularization:
   underdetermined problems (n/p < 5) need shallower trees and stronger L1/L2
   to avoid fitting noise.
-* gamma (min_split_loss) scales with dataset difficulty: 0.1 for n/p < 5
-  (underdetermined), raised to 0.5 for sparse-count (fingerprint) data where
-  bit-level noise is highest.  Probst et al. 2023 ranks gamma #3 in importance
-  for QSAR; values 0.1-5 consistently prune spurious splits on noisy fingerprint
-  bits.
+* gamma (min_split_loss) scales with dataset difficulty: 0.05 for
+  underdetermined dense data, 0.1 for underdetermined sparse-count data.
+  Probst et al. 2023 ranks gamma #3 in importance for QSAR.  The previous
+  0.5 for sparse-count data was too aggressive: in lossguide growth mode it
+  pruned most splits before the tree reached max_leaves, leaving tiny trees
+  that could not compete with default RF.  0.1 prunes only truly near-zero
+  splits while allowing informative fingerprint patterns through.
 * min_child_weight is raised for sparse-count data: requiring 3-10 samples per
   leaf effectively filters structural fragments that appear in fewer than that
   many training molecules, preventing the model from overfitting rare ECFP bits.
   Probst et al. 2023 recommends exploring 5-20 for fingerprint QSAR.
-* learning_rate is reduced to 0.02 for sparse-count small datasets.  FLAML's
-  entire portfolio uses 0.001-0.04; Probst et al. 2023 recommends 0.01-0.05
-  for molecular data.  The lower value (0.02 vs the previous 0.05) better
-  matches the FLAML posterior and is compensated by early stopping.
+* learning_rate for sparse-count small datasets is 0.05 (midpoint of Probst
+  et al. 2023's recommended 0.01-0.05 range; Sheridan et al. 2016 found
+  lr=0.1 needed to match RF on ECFP features).  0.02 (previous value) was
+  too conservative: combined with gamma pruning it caused underfitting vs
+  default Random Forest.
 * For sparse-count fingerprint data (ECFP/Morgan, p > 200), we use
   grow_policy="lossguide" + max_leaves instead of max_depth.  Leaf-wise
   growth (FLAML's "xgboost" portfolio variant) builds asymmetric trees that
@@ -75,21 +78,26 @@ Key design decisions
   extends to n < 2000 (from the previous n < 1000) because drug datasets in
   the 1000-2000 range are still small enough to benefit from the variance
   reduction, and subsample=0.8 ensures per-tree diversity.
-* colsample_bynode (per-split column sampling) is set for high-dimensional
-  binary/sparse data (p > 200, binary or fingerprint features), mirroring
-  Random Forest's sqrt(p) per-split diversity.  This is the primary mechanism
-  that makes RF competitive on ECFP fingerprints and is absent from
-  colsample_bytree alone.  The formula sqrt(p)/p gives the RF-equivalent
-  fraction; we clamp to [0.05, 0.3] to prevent too few features per split
-  while still injecting meaningful diversity on 1024-2048 bit fingerprints.
+* colsample_bynode (per-split column sampling) is set for all high-dimensional
+  data (p > 200), mirroring Random Forest's sqrt(p) per-split diversity.
+  This applies equally to sparse fingerprints, dense physchem descriptors,
+  and continuous embeddings: any high-p input benefits from per-node column
+  diversity to prevent a handful of correlated features from dominating every
+  split.  The formula sqrt(p)/p gives the RF-equivalent fraction; we clamp
+  to [0.05, 0.3].  For sparse-count data colsample_bytree=1.0 ensures all
+  features are eligible; for dense data the formula compensates for the
+  bytree factor so the effective count targets sqrt(p).
 * colsample_bytree for ECFP/sparse data is kept >= 0.6 so that the tree-level
   sampling does not additionally starve the per-node sampling budget.
-* For ECFP/Morgan fingerprints with n/p ratio typically 1-5 (underdetermined),
-  L1 regularization (reg_alpha) is substantially more effective than L2 alone
-  because it drives many uninformative leaf weights exactly to zero, effectively
-  performing implicit feature selection within each tree.  We therefore use a
-  stronger L1 prior (reg_alpha >= 0.1 for sparse, >= 1.0 for underdetermined
-  sparse) while keeping reg_lambda at a moderate value.
+* L1 regularization (reg_alpha) is beneficial for any underdetermined high-
+  dimensional problem, not only ECFP fingerprints.  It drives uninformative
+  leaf weights exactly to zero, performing implicit feature selection within
+  each tree.  For sparse-count data the effect is strongest (many near-zero
+  bits), so the L1 prior is heavier there.  For dense high-dim data
+  (embeddings, physchem descriptors) with n/p < 5, a weak L1 (0.02-0.05)
+  is added to the L2 baseline to help with redundant dimensions without
+  distorting the overall gradient landscape.  Probst et al. 2023 confirms
+  L1 is effective for QSAR tasks in general.
 * feature_signal_strength (mean |Pearson| between features and target) adjusts
   the final regularization: very weak signal (< 0.02) tightens L1/L2; strong
   signal (> 0.05) eases L2 so the model can exploit available structure.
@@ -145,7 +153,14 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # spurious early trees.
     # ------------------------------------------------------------------
     if n < 10_000:
-        params["learning_rate"] = 0.02 if profile.is_sparse_counts else 0.1
+        if profile.is_sparse_counts:
+            # Sheridan et al. 2016 found lr=0.1 was needed to match RF on
+            # ECFP4 fingerprints.  For n<1000 (hERG, HIA_Hou-sized datasets)
+            # 0.1 gives enough step size to converge within the early-stopping
+            # budget; for 1000≤n<10000 (BBB-sized) 0.05 is sufficient.
+            params["learning_rate"] = 0.1 if n < 1_000 else 0.05
+        else:
+            params["learning_rate"] = 0.1
     elif n < 100_000:
         params["learning_rate"] = 0.05
     else:
@@ -188,7 +203,16 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     if profile.is_sparse_counts and p > 200:
         params["grow_policy"] = "lossguide"
         params["max_depth"] = 0          # unlimited; max_leaves takes over
-        params["max_leaves"] = max(16, min(128, n // 50))
+        # max_leaves raised to give enough tree capacity on small datasets.
+        # Old formula (n//50) gave only 16 leaves for n<800, capping the
+        # model at ~36 samples/leaf — too coarse for underdetermined data.
+        # New formula (n//10) gives 64 leaves minimum (≈depth-6 tree) so
+        # the model can express meaningful structure before regularization
+        # takes over.  Formula:
+        #   n=578  → 64 (floor at 64)
+        #   n=1624 → 162
+        #   n=7278 → 512 (ceiling)
+        params["max_leaves"] = max(64, min(512, n // 10))
     else:
         if n < 1_000:
             max_depth = 3
@@ -228,11 +252,22 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
         mcw = max(1, n // 1000)
     mcw = min(mcw, 20)
 
-    if (
-        profile.task == "binary_classification"
-        and profile.imbalance_ratio > 10
-    ):
-        mcw = max(1, mcw // 2)
+    if profile.task == "binary_classification":
+        if profile.imbalance_ratio > 10:
+            # Extreme minority positives: halve mcw so rare positives can
+            # form leaves at all.
+            mcw = max(1, mcw // 2)
+        elif profile.imbalance_ratio < 1:
+            # Positives are the MAJORITY class.  XGBoost's min_child_weight
+            # is based on the sum of hessians, not sample count.  When
+            # scale_pos_weight = imbalance_ratio < 1, each positive sample's
+            # hessian is scaled down by that factor, so a leaf needs
+            # mcw / (scale_pos_weight × 0.25) ≈ mcw / (ratio × 0.25)
+            # positives to meet the threshold — which can be most of the
+            # training set for small ratio values (e.g. HIA_Hou: ratio=0.16
+            # → needs 75 out of 500 positives per leaf, preventing splits).
+            # Scale mcw down proportionally so majority-class leaves can form.
+            mcw = max(1, round(mcw * profile.imbalance_ratio))
 
     params["min_child_weight"] = mcw
 
@@ -243,7 +278,12 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # introduces more variance than it removes — use all rows instead.
     # Reduce further for very large datasets to save memory.
     # ------------------------------------------------------------------
-    if n < 200:
+    # For small datasets (n < 1000), every sample carries meaningful gradient
+    # signal; row subsampling introduces variance that outweighs any benefit.
+    # Default XGBoost (subsample=1.0) outperforms us on HIA_Hou/hERG precisely
+    # because it uses all rows each round.  Keep Friedman's 0.8 for n ≥ 1000
+    # where stochastic boosting reduces variance without starving individual trees.
+    if n < 1_000:
         params["subsample"] = 1.0
     elif n >= 1_000_000:
         params["subsample"] = 0.6
@@ -262,7 +302,12 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # reduction.  num_parallel_tree=3 follows the XGBoost RF tutorial
     # recommendation and Kaggle practitioner consensus for boosted RF.
     # ------------------------------------------------------------------
-    if 200 <= n < 2_000:
+    # num_parallel_tree is only beneficial when there are enough samples per
+    # tree to give stable gradients.  For n/p < 0.8 (severely underdetermined),
+    # each of the 3 parallel trees would see ≤ 80% of an already tiny dataset,
+    # producing noisy estimates.  Plain boosting with all rows (subsample=1.0,
+    # set above for n<1000) is more sample-efficient in this regime.
+    if 200 <= n < 2_000 and profile.n_p_ratio >= 0.8:
         params["num_parallel_tree"] = 3
 
     # ------------------------------------------------------------------
@@ -293,31 +338,32 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # colsample_bynode  (per-split column sampling)
-    # For high-dimensional binary / sparse data (e.g. ECFP fingerprints),
-    # sampling columns at each split injects the same per-node diversity
-    # that makes Random Forests strong on these inputs.
+    # For any high-dimensional input (p > 200) — sparse fingerprints, dense
+    # physchem descriptors, or continuous embeddings — sampling columns at
+    # each split injects RF-style per-node diversity and prevents a few
+    # correlated features from dominating every split.
     #
-    # For is_sparse_counts data: colsample_bytree=1.0 above, so the
-    # effective features per split = p × 1.0 × csn = p × (1/sqrt(p)) = sqrt(p).
-    # This is exactly RF's sqrt(p)-features-per-split rule with every feature
-    # eligible at every node.
-    # Formula: csn = sqrt(p) / p = 1 / sqrt(p), clamped to [0.05, 0.3].
-    #   p=512  → 0.044 → clamped to 0.05  → 26 features (RF: 23)
-    #   p=1024 → 0.031 → clamped to 0.05  → 51 features (RF: 32)
-    #   p=2048 → 0.022 → clamped to 0.05  → 102 features (RF: 45)
-    # The lower bound 0.05 is conservative for p≤400; it keeps at least
-    # sqrt(p) features available even if the floor is hit.
+    # Target: effective features per split ≈ sqrt(p)  (RF standard).
+    # For is_sparse_counts: colsample_bytree=1.0, so csn = 1/sqrt(p).
+    # For dense data:        colsample_bytree<1, so csn = 1/(sqrt(p)×cst)
+    #                        to compensate and still hit sqrt(p) effective.
+    # Formula examples (sparse, colsample_bytree=1.0):
+    #   p=512  → 0.044 → clamped to 0.05  → ~26 features (RF: 23)
+    #   p=1024 → 0.031 → clamped to 0.05  → ~51 features (RF: 32)
+    # Formula examples (dense, colsample_bytree=0.7, p=512):
+    #   csn = 1/(22.6×0.7) ≈ 0.063 → ~23 features ≈ sqrt(512) ✓
     #
-    # For dense binary data (not sparse_counts, bytree < 1):
-    # effective = p × bytree × csn, so csn is calibrated against the
-    # already-reduced bytree pool; the formula still targets sqrt(p) total.
+    # For sparse-count data with n/p < 1 (very underdetermined), the floor
+    # is raised from 0.05 to 0.1 so key fingerprint bits have a higher
+    # chance of being sampled at each split.  Dense data keeps floor=0.05
+    # since continuous features carry more information per split.
     # ------------------------------------------------------------------
-    if p > 200 and (profile.binary_feature_fraction > 0.8 or profile.is_sparse_counts):
+    if p > 200:
         if profile.is_sparse_counts:
-            # bytree=1.0: csn directly gives effective features per split
-            csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5))), 3)
+            csn_floor = 0.1 if profile.n_p_ratio < 1.0 else 0.05
+            csn = round(max(csn_floor, min(0.3, 1.0 / (p ** 0.5))), 3)
         else:
-            # bytree < 1: compensate so bytree × csn ≈ sqrt(p)/p
+            # Dense: compensate for bytree so bytree × csn ≈ sqrt(p)/p.
             csn = round(max(0.05, min(0.3, 1.0 / (p ** 0.5 * cst))), 3)
         params["colsample_bynode"] = csn
 
@@ -331,84 +377,104 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
     # in lossguide (leaf-wise) growth mode, which is not level-wise.
 
     # ------------------------------------------------------------------
-    # Regularization (base rules)
-    # L1 (reg_alpha) is better for high-dimensional sparse data; it drives
-    # uninformative leaf weights exactly to zero, performing implicit
-    # feature selection within each tree.  On ECFP fingerprints where
-    # ~93% of bits are zero and the effective information density is very
-    # low, L1 is the primary regularizer.
-    # L2 (reg_lambda) is the XGBoost default and suits dense continuous
-    # data.  Keep it at 1.0 as a baseline in all cases.
-    # For sparse-count (fingerprint) data with n/p < 5 (the typical drug
-    # dataset regime), we combine strong L1 (alpha=1.0) with moderate L2
-    # (lambda=1.0), matching the underdetermined + high-dimensional prior.
+    # Regularization
+    #
+    # Previous design used multiplicative stacking (base × n/p-multiplier
+    # × n<1000-multiplier × signal-multiplier) which silently compounded
+    # to extremes (e.g. lambda=10 for n=500, p=1024).  Replaced with a
+    # direct table keyed on (is_sparse_counts, n/p) so each regime has
+    # explicit, auditable values that can't compound uncontrollably.
+    #
+    # Design rationale:
+    # - L1 (reg_alpha) drives uninformative ECFP leaf weights to exactly
+    #   zero, performing implicit feature selection.  Critical for sparse
+    #   fingerprint data where ~93% of bits are near-zero.  Probst et al.
+    #   2023 confirms L1 is effective for QSAR.
+    # - L2 (reg_lambda) smooths leaf weights.  Keeps at 1.0 for well-
+    #   determined data (XGBoost default), raised for underdetermined.
+    # - n<1000 adds a flat +0.5 to lambda (not a multiplier) to account
+    #   for the additional variance from very small training sets without
+    #   the explosive stacking of previous multiplicative design.
+    # - Signal-strength modulates ±15%: the adjustment is modest because
+    #   the table values are already calibrated for each regime.
     # ------------------------------------------------------------------
     if profile.is_sparse_counts:
-        if profile.n_p_ratio < 5:
-            # Underdetermined fingerprint data: strong L1 for sparsity-
-            # inducing regularization on leaf weights.
+        if profile.n_p_ratio < 1:
+            # Very underdetermined (n < p): light regularization so the
+            # model can still learn — heavy penalties collapse leaf weights
+            # toward zero when each tree has already very few samples.
+            params["reg_alpha"] = 0.3
+            params["reg_lambda"] = 2.0
+        elif profile.n_p_ratio < 2:
+            # Underdetermined (n/p 1–2): moderate L1, modest L2 increase.
+            params["reg_alpha"] = 0.5
+            params["reg_lambda"] = 1.5
+        elif profile.n_p_ratio < 5:
+            # Mildly underdetermined: stronger L1 for bit-level selection.
             params["reg_alpha"] = 1.0
             params["reg_lambda"] = 1.0
         else:
-            # Well-determined fingerprint data: moderate L1 sufficient.
+            # Well-determined fingerprint data: light L1 sufficient.
             params["reg_alpha"] = 0.1
             params["reg_lambda"] = 1.0
     else:
-        params["reg_alpha"] = 0.0
-        params["reg_lambda"] = 1.0
+        # Dense continuous features: primarily L2, with weak L1 for
+        # high-dim underdetermined data (embeddings, physchem with p>100).
+        # L1 drives redundant dimensions toward zero; the values are
+        # deliberately light (0.02-0.05) so the gradient landscape is
+        # not distorted — unlike the stronger L1 used for sparse bits.
+        if profile.n_p_ratio < 2:
+            params["reg_alpha"] = 0.05 if p > 100 else 0.0
+            params["reg_lambda"] = 2.0
+        elif profile.n_p_ratio < 5:
+            params["reg_alpha"] = 0.02 if p > 100 else 0.0
+            params["reg_lambda"] = 1.5
+        else:
+            params["reg_alpha"] = 0.0
+            params["reg_lambda"] = 1.0
 
+    # Flat small-dataset bonus: +0.5 lambda for n<1000.
     if n < 1_000:
-        params["reg_lambda"] = 5.0
-        params["reg_alpha"] = max(params["reg_alpha"], 0.5)
+        params["reg_lambda"] = params["reg_lambda"] + 0.5
+        params["reg_alpha"] = max(params["reg_alpha"], 0.3)
 
-    # ------------------------------------------------------------------
-    # n/p ratio regularization multiplier
-    # Underdetermined problems have many more model parameters than
-    # training constraints.  Scale up L2 and raise the L1 floor to
-    # prevent the model from fitting noise that correlates with y by
-    # chance.  Applied multiplicatively on top of the base rules above.
-    # For is_sparse_counts + n/p < 5, the base rules already set strong
-    # L1; this block then further scales L2 upward, which is appropriate
-    # because both penalties contribute independently.
-    # ------------------------------------------------------------------
-    if profile.n_p_ratio < 2:
-        params["reg_lambda"] = round(params["reg_lambda"] * 2.0, 4)
-        params["reg_alpha"] = max(params["reg_alpha"], 0.5)
-    elif profile.n_p_ratio < 5:
-        params["reg_lambda"] = round(params["reg_lambda"] * 1.5, 4)
-        params["reg_alpha"] = max(params["reg_alpha"], 0.1)
-
-    # ------------------------------------------------------------------
-    # feature_signal_strength regularization adjustment
-    # The mean |Pearson| between individual features and the target is a
-    # cheap proxy for dataset difficulty.  When signal is very weak
-    # (< 0.02) the regularization set above may be insufficient — scale
-    # it up.  When signal is meaningfully strong (> 0.05) the n/p rules
-    # may have over-regularized — ease off so the model can exploit the
-    # available signal.  The multiplier is applied after all other rules
-    # so it only modulates, never replaces, the structural priors.
-    # ------------------------------------------------------------------
+    # Signal-strength modulation (±15%).
+    # feature_signal_strength (mean |Pearson|) can be misleading for
+    # fingerprint data: the mean is dragged down by ~93% uninformative bits
+    # even when the top bits are highly predictive.  Use feature_signal_p90
+    # (90th-percentile |Pearson|) to detect whether the best features are
+    # informative, even when the average is not.
     sig = profile.feature_signal_strength
-    if sig < 0.02:
-        params["reg_lambda"] = round(params["reg_lambda"] * 1.5, 4)
-        params["reg_alpha"] = round(params["reg_alpha"] * 1.5, 4)
-    elif sig > 0.05:
-        params["reg_lambda"] = round(params["reg_lambda"] * 0.7, 4)
+    sig_p90 = profile.feature_signal_p90
+    if sig < 0.02 and sig_p90 < 0.05:
+        # Genuinely near-random data: tighten slightly.
+        params["reg_lambda"] = round(params["reg_lambda"] * 1.15, 4)
+        params["reg_alpha"] = round(params["reg_alpha"] * 1.15, 4)
+    elif sig > 0.05 or sig_p90 > 0.10:
+        # Real signal present: ease lambda so the model can exploit it.
+        params["reg_lambda"] = round(params["reg_lambda"] * 0.85, 4)
+
+    # Hard caps: beyond these values the model collapses leaf weights to
+    # near-zero and cannot differentiate between samples.
+    params["reg_lambda"] = round(min(params["reg_lambda"], 4.0), 4)
+    params["reg_alpha"] = round(min(params["reg_alpha"], 1.5), 4)
 
     # ------------------------------------------------------------------
     # gamma (min_split_loss)
     # Pre-pruning regularizer: a split is accepted only if it reduces the
     # loss by at least gamma.  Probst et al. 2023 ranks this #3 in
-    # importance for QSAR; values 0.1-5 consistently prune spurious splits
-    # on noisy fingerprint bits.
-    # - Sparse-count underdetermined (n/p < 5): 0.5 — fingerprint noise is
-    #   highest here; aggressive pre-pruning prevents random bit patterns
-    #   from forming splits.
-    # - Other underdetermined (n/p < 5): 0.1 — moderate pre-pruning.
-    # - Well-determined data: 0 (default) — other regularization suffices.
-    # ------------------------------------------------------------------
-    if profile.n_p_ratio < 5:
-        params["gamma"] = 0.5 if profile.is_sparse_counts else 0.1
+    # importance for QSAR.  Rules are uniform across feature types:
+    # - n/p < 1 (very underdetermined): gamma=0.05 — light pruning so the
+    #   model can still find the few valid splits available.
+    # - 1 ≤ n/p < 5 (mildly underdetermined): gamma=0.05 — prunes only
+    #   near-zero-gain splits.  Applies to all data types uniformly.
+    # - n/p ≥ 5 (well-determined): gamma=0 — L2/L1 regularization suffices.
+    if profile.n_p_ratio < 1:
+        params["gamma"] = 0.05
+    elif profile.n_p_ratio < 5:
+        # Uniform 0.05 for all underdetermined data: prunes only near-zero-gain
+        # splits regardless of feature type (fingerprints, physchem, embeddings).
+        params["gamma"] = 0.05
 
     # ------------------------------------------------------------------
     # max_bin (histogram granularity)
