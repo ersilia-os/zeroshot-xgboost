@@ -58,9 +58,7 @@ _RANDOM_STATE    = 42
 # Keys that guide training but are not native XGBoost parameters
 _META_KEYS = frozenset({"n_estimators", "early_stopping_rounds"})
 
-# Minimum validation-score gain over the 'default' preset required before
-# switching to a different preset.  Guards against selection noise on small
-# validation splits where AUC differences are within random fluctuation.
+# Base minimum gain; the effective threshold is adaptive (see _min_gain_threshold).
 _PORTFOLIO_MIN_GAIN = 0.005
 
 
@@ -377,6 +375,27 @@ def _train_phase2(X_full, y_full, params: dict, best_iter: int):
     return booster
 
 
+def _min_gain_threshold(profile: DatasetProfile, y_val: np.ndarray) -> float:
+    """
+    Adaptive minimum-gain threshold for portfolio selection.
+
+    AUC noise scales as 1/sqrt(n_minority), so the required gain for a preset
+    to convincingly beat 'default' is proportional to that noise level.  This
+    prevents selection noise from winning on small imbalanced val splits while
+    still allowing genuine improvements to be captured on larger datasets.
+
+    Formula: max(_PORTFOLIO_MIN_GAIN, 0.5 / sqrt(n_effective))
+      - binary classification: n_effective = minority-class count in val set
+      - regression: n_effective = total val set size
+    """
+    if profile.task == "binary_classification":
+        n_eff = int(min(np.sum(y_val == 0), np.sum(y_val == 1)))
+    else:
+        n_eff = len(y_val)
+    noise_based = 0.5 / max(1, n_eff) ** 0.5
+    return max(_PORTFOLIO_MIN_GAIN, noise_based)
+
+
 def _portfolio_select(X_train, y_train, X_val, y_val,
                       profile: DatasetProfile, device: str):
     """
@@ -445,12 +464,13 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
         scores["default"] = best_score
     elif (best_name != "default"
           and default_params is not None
-          and best_score - default_score < _PORTFOLIO_MIN_GAIN):
+          and best_score - default_score < _min_gain_threshold(profile, y_val)):
         # The best preset does not convincingly beat the default — fall back
         # to default to avoid propagating selection noise to the final model.
+        threshold = _min_gain_threshold(profile, y_val)
         logger.debug(
             f"[portfolio] {best_name} gain={best_score - default_score:+.4f} "
-            f"< threshold={_PORTFOLIO_MIN_GAIN}; reverting to default"
+            f"< threshold={threshold:.4f}; reverting to default"
         )
         best_name   = "default"
         best_params = default_params
