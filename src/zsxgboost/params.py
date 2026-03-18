@@ -112,7 +112,8 @@ from typing import Dict, Any
 from .inspector import DatasetProfile
 
 
-def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
+def get_params(profile: DatasetProfile, device: str = "cpu",
+               nthread: int = -1) -> Dict[str, Any]:
     """
     Return a dict of XGBoost parameters for the given dataset profile.
 
@@ -122,6 +123,9 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
         Output of zsxgboost.inspect(X, y).
     device : str
         "cpu" or "gpu".
+    nthread : int
+        Number of parallel threads.  -1 means "use all available CPU cores"
+        (XGBoost default; ignored on GPU).
 
     Returns
     -------
@@ -492,9 +496,12 @@ def get_params(profile: DatasetProfile, device: str = "cpu") -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # Parallelism (CPU only; GPU manages its own threads)
+    # nthread=-1 → use all available CPU cores (XGBoost default behaviour).
+    # A user-supplied nthread > 0 overrides this for reproducibility or
+    # resource-constrained environments.
     # ------------------------------------------------------------------
     if device == "cpu":
-        params["nthread"] = os.cpu_count() or 1
+        params["nthread"] = (os.cpu_count() or 1) if nthread == -1 else nthread
 
     # ------------------------------------------------------------------
     # Task-specific parameters

@@ -60,7 +60,8 @@ def _add_task_params(params: Dict[str, Any], profile: DatasetProfile) -> None:
         params["eval_metric"] = "rmse"
 
 
-def xgb_default_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
+def xgb_default_params(profile: DatasetProfile, device: str,
+                       nthread: int = -1) -> Dict[str, Any]:
     """
     XGBoost out-of-the-box defaults.
 
@@ -68,6 +69,8 @@ def xgb_default_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
     no tuning.  Only the task objective, eval metric, and imbalance correction
     are added to enable a fair comparison.
     """
+    n = profile.n_samples
+    max_bin = 128 if n > 100_000 else 256
     params: Dict[str, Any] = {
         "tree_method": "hist",
         "device": "cuda" if device == "gpu" else "cpu",
@@ -78,15 +81,19 @@ def xgb_default_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
         "colsample_bytree": 1.0,    # XGBoost default
         "reg_alpha": 0.0,           # XGBoost default
         "reg_lambda": 1.0,          # XGBoost default
-        "max_bin": 256,
+        "max_bin": max_bin,
         "n_estimators": 2000,
         "early_stopping_rounds": 50,
     }
+    if device == "cpu":
+        import os
+        params["nthread"] = (os.cpu_count() or 1) if nthread == -1 else nthread
     _add_task_params(params, profile)
     return params
 
 
-def flaml_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
+def flaml_params(profile: DatasetProfile, device: str,
+                 nthread: int = -1) -> Dict[str, Any]:
     """
     FLAML zero-shot configuration via 1-NN meta-feature matching.
 
@@ -125,6 +132,7 @@ def flaml_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
 
     hp = data["portfolio"][best_idx]
     lr = float(hp["learning_rate"])
+    max_bin = 128 if n > 100_000 else 256
 
     params: Dict[str, Any] = {
         "tree_method":       "hist",
@@ -139,15 +147,19 @@ def flaml_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
         "colsample_bytree":  float(hp["colsample_bytree"]),
         "reg_alpha":         float(hp["reg_alpha"]),
         "reg_lambda":        float(hp["reg_lambda"]),
-        "max_bin":           256,
+        "max_bin":           max_bin,
         "n_estimators":      2000,
         "early_stopping_rounds": min(200, max(50, int(round(50 * 0.1 / lr)))),
     }
+    if device == "cpu":
+        import os
+        params["nthread"] = (os.cpu_count() or 1) if nthread == -1 else nthread
     _add_task_params(params, profile)
     return params
 
 
-def autogluon_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
+def autogluon_params(profile: DatasetProfile, device: str,
+                     nthread: int = -1) -> Dict[str, Any]:
     """
     AutoGluon tabular XGBoost default configuration.
 
@@ -162,6 +174,8 @@ def autogluon_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
       - n_estimators = 10000 in AutoGluon; capped at 2000 here since early
         stopping is the real control.
     """
+    n = profile.n_samples
+    max_bin = 128 if n > 100_000 else 256
     params: Dict[str, Any] = {
         "tree_method":      "hist",
         "device":           "cuda" if device == "gpu" else "cpu",
@@ -172,15 +186,19 @@ def autogluon_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
         "colsample_bytree": 1.0,
         "reg_alpha":        0.0,
         "reg_lambda":       1.0,
-        "max_bin":          256,
+        "max_bin":          max_bin,
         "n_estimators":     2000,
         "early_stopping_rounds": 50,
     }
+    if device == "cpu":
+        import os
+        params["nthread"] = (os.cpu_count() or 1) if nthread == -1 else nthread
     _add_task_params(params, profile)
     return params
 
 
-def rf_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
+def rf_params(profile: DatasetProfile, device: str,
+              nthread: int = -1) -> Dict[str, Any]:
     """
     XGBoost configured as a boosted Random Forest.
 
@@ -194,8 +212,10 @@ def rf_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
     fair: each round builds 3 parallel trees, the total ensemble grows
     across rounds, and early stopping fires when validation AUC plateaus.
     """
+    n = profile.n_samples
     p = profile.n_features
     csn = round(max(0.05, min(0.5, 1.0 / (p ** 0.5))), 3)
+    max_bin = 128 if n > 100_000 else 256
 
     params: Dict[str, Any] = {
         "tree_method":      "hist",
@@ -209,9 +229,12 @@ def rf_params(profile: DatasetProfile, device: str) -> Dict[str, Any]:
         "min_child_weight": 1,
         "reg_alpha":        0.0,
         "reg_lambda":       1.0,
-        "max_bin":          256,
+        "max_bin":          max_bin,
         "n_estimators":     2000,
         "early_stopping_rounds": 50,
     }
+    if device == "cpu":
+        import os
+        params["nthread"] = (os.cpu_count() or 1) if nthread == -1 else nthread
     _add_task_params(params, profile)
     return params

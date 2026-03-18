@@ -61,6 +61,36 @@ _META_KEYS = frozenset({"n_estimators", "early_stopping_rounds"})
 # Base minimum gain; the effective threshold is adaptive (see _min_gain_threshold).
 _PORTFOLIO_MIN_GAIN = 0.005
 
+# Cached GPU availability check (None = not yet tested)
+_GPU_AVAILABLE: bool | None = None
+
+
+def _resolve_device(device: str) -> str:
+    """
+    Resolve 'auto' to 'gpu' or 'cpu' based on CUDA availability.
+
+    The check is performed once and cached.  'cpu' and 'gpu' are returned
+    unchanged.  When device='auto', a single 1-round XGBoost training is
+    attempted on CUDA; if it succeeds, 'gpu' is returned for all subsequent
+    calls.
+    """
+    global _GPU_AVAILABLE
+    if device != "auto":
+        return device
+    if _GPU_AVAILABLE is None:
+        try:
+            dm = xgb.DMatrix([[1.0]], label=[0])
+            xgb.train(
+                {"tree_method": "hist", "device": "cuda", "verbosity": 0},
+                dm, num_boost_round=1,
+            )
+            _GPU_AVAILABLE = True
+            logger.debug("device=auto: CUDA detected, using GPU")
+        except Exception:
+            _GPU_AVAILABLE = False
+            logger.debug("device=auto: no CUDA, using CPU")
+    return "gpu" if _GPU_AVAILABLE else "cpu"
+
 
 class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -69,13 +99,17 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     Parameters
     ----------
     device : str
-        "cpu" or "gpu".
+        "cpu", "gpu", or "auto".  "auto" detects CUDA availability at the
+        first .fit() call and uses GPU when available, CPU otherwise.
     verbose : bool
         If True, log chosen parameters and winning preset name.
     portfolio : bool
         If True (default), train all five preset configurations on a validation
         split and select the best.  If False, use the XGBoost default preset
         only (faster; useful as a no-tuning baseline).
+    nthread : int
+        Number of parallel threads for XGBoost.  -1 (default) lets XGBoost
+        use all available CPU cores.
 
     Attributes (after .fit())
     --------------------------
@@ -91,21 +125,23 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     """
 
     def __init__(self, device: str = "cpu", verbose: bool = False,
-                 portfolio: bool = True):
+                 portfolio: bool = True, nthread: int = -1):
         self.device = device
         self.verbose = verbose
         self.portfolio = portfolio
+        self.nthread = nthread
 
     def fit(self, X, y):
         logger.set_verbosity(self.verbose)
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="binary_classification")
         self.profile_ = profile
+        device = _resolve_device(self.device)
 
         logger.info(
             f"Binary classification | n={profile.n_samples}, p={profile.n_features} | "
             f"imbalance_ratio={profile.imbalance_ratio:.2f} | "
-            f"sparse_counts={profile.is_sparse_counts}"
+            f"sparse_counts={profile.is_sparse_counts} | device={device}"
         )
 
         X_train, X_val, y_train, y_val, did_split = _validation_split(
@@ -118,13 +154,13 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         if did_split:
             if self.portfolio:
                 best_name, best_params, best_iter, scores = _portfolio_select(
-                    X_train, y_train, X_val, y_val, profile, self.device
+                    X_train, y_train, X_val, y_val, profile, device, self.nthread
                 )
                 self.preset_name_ = best_name
                 self.params_ = best_params
                 self.portfolio_scores_ = scores
             else:
-                best_params = xgb_default_params(profile, device=self.device)
+                best_params = xgb_default_params(profile, device=device, nthread=self.nthread)
                 _, best_iter, _ = _train_phase1(
                     X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
                 )
@@ -140,7 +176,7 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
             final_booster = _train_phase2(X, y, best_params, best_iter)
         else:
             # Dataset too small to split: use default preset
-            params = xgb_default_params(profile, device=self.device)
+            params = xgb_default_params(profile, device=device, nthread=self.nthread)
             self.params_ = params
             self.preset_name_ = "default"
             self.portfolio_scores_ = {}
@@ -205,13 +241,17 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
     Parameters
     ----------
     device : str
-        "cpu" or "gpu".
+        "cpu", "gpu", or "auto".  "auto" detects CUDA availability at the
+        first .fit() call and uses GPU when available, CPU otherwise.
     verbose : bool
         If True, log chosen parameters and winning preset name.
     portfolio : bool
         If True (default), train all five preset configurations on a validation
         split and select the best.  If False, use the XGBoost default preset
         only (faster; useful as a no-tuning baseline).
+    nthread : int
+        Number of parallel threads for XGBoost.  -1 (default) lets XGBoost
+        use all available CPU cores.
 
     Attributes (after .fit())
     --------------------------
@@ -224,21 +264,23 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
     """
 
     def __init__(self, device: str = "cpu", verbose: bool = False,
-                 portfolio: bool = True):
+                 portfolio: bool = True, nthread: int = -1):
         self.device = device
         self.verbose = verbose
         self.portfolio = portfolio
+        self.nthread = nthread
 
     def fit(self, X, y):
         logger.set_verbosity(self.verbose)
         y = np.asarray(y).ravel()
         profile = _inspect(X, y, task="regression")
         self.profile_ = profile
+        device = _resolve_device(self.device)
 
         logger.info(
             f"Regression | n={profile.n_samples}, p={profile.n_features} | "
             f"y_skewness={profile.y_skewness:.3f} | "
-            f"sparse_counts={profile.is_sparse_counts}"
+            f"sparse_counts={profile.is_sparse_counts} | device={device}"
         )
 
         X_train, X_val, y_train, y_val, did_split = _validation_split(
@@ -251,13 +293,13 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         if did_split:
             if self.portfolio:
                 best_name, best_params, best_iter, scores = _portfolio_select(
-                    X_train, y_train, X_val, y_val, profile, self.device
+                    X_train, y_train, X_val, y_val, profile, device, self.nthread
                 )
                 self.preset_name_ = best_name
                 self.params_ = best_params
                 self.portfolio_scores_ = scores
             else:
-                best_params = xgb_default_params(profile, device=self.device)
+                best_params = xgb_default_params(profile, device=device, nthread=self.nthread)
                 _, best_iter, _ = _train_phase1(
                     X_train, y_train, X_val, y_val, best_params, verbose=self.verbose
                 )
@@ -272,7 +314,7 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
             )
             final_booster = _train_phase2(X, y, best_params, best_iter)
         else:
-            params = xgb_default_params(profile, device=self.device)
+            params = xgb_default_params(profile, device=device, nthread=self.nthread)
             self.params_ = params
             self.preset_name_ = "default"
             self.portfolio_scores_ = {}
@@ -397,7 +439,7 @@ def _min_gain_threshold(profile: DatasetProfile, y_val: np.ndarray) -> float:
 
 
 def _portfolio_select(X_train, y_train, X_val, y_val,
-                      profile: DatasetProfile, device: str):
+                      profile: DatasetProfile, device: str, nthread: int = -1):
     """
     Train all five presets on (X_train, X_val) with early stopping.
     Return (best_preset_name, best_params, best_iteration, scores_dict).
@@ -414,11 +456,11 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
     winning preset name and score are logged at INFO level.
     """
     candidates = [
-        ("internal",  _get_params(profile, device)),
-        ("default",   xgb_default_params(profile, device)),
-        ("flaml",     flaml_params(profile, device)),
-        ("autogluon", autogluon_params(profile, device)),
-        ("rf",        rf_params(profile, device)),
+        ("internal",  _get_params(profile, device, nthread=nthread)),
+        ("default",   xgb_default_params(profile, device, nthread=nthread)),
+        ("flaml",     flaml_params(profile, device, nthread=nthread)),
+        ("autogluon", autogluon_params(profile, device, nthread=nthread)),
+        ("rf",        rf_params(profile, device, nthread=nthread)),
     ]
 
     scores      = {}
@@ -455,7 +497,7 @@ def _portfolio_select(X_train, y_train, X_val, y_val,
     if best_name is None:
         # All presets failed (extremely unusual) — fall back to default
         logger.debug("[portfolio] all presets failed; using default preset")
-        params = xgb_default_params(profile, device)
+        params = xgb_default_params(profile, device, nthread=nthread)
         _, best_iter, best_score = _train_phase1(
             X_train, y_train, X_val, y_val, params, verbose=False
         )
