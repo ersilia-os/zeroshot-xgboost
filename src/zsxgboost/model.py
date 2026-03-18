@@ -173,7 +173,7 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
                 f"lr={best_params['learning_rate']} | "
                 f"colsample_bytree={best_params['colsample_bytree']}"
             )
-            final_booster = _train_phase2(X, y, best_params, best_iter)
+            final_booster, best_iter = _train_phase2(X, y, best_params, best_iter)
         else:
             # Dataset too small to split: use default preset
             params = xgb_default_params(profile, device=device, nthread=self.nthread)
@@ -312,7 +312,7 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
                 f"lr={best_params['learning_rate']} | "
                 f"colsample_bytree={best_params['colsample_bytree']}"
             )
-            final_booster = _train_phase2(X, y, best_params, best_iter)
+            final_booster, best_iter = _train_phase2(X, y, best_params, best_iter)
         else:
             params = xgb_default_params(profile, device=device, nthread=self.nthread)
             self.params_ = params
@@ -399,22 +399,34 @@ def _train_phase1(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
 
 def _train_phase2(X_full, y_full, params: dict, best_iter: int):
     """
-    Phase 2: retrain on the full dataset for exactly best_iter+1 rounds.
+    Phase 2: retrain on the full dataset for at least early_stopping_rounds rounds.
+
+    The round count is max(best_iter, early_stopping_rounds).  Using
+    early_stopping_rounds as a floor guards against the case where a noisy
+    validation AUC (e.g. only 15 minority samples) triggers early stopping
+    at a very small iteration — say round 4 — which would leave the final
+    model massively undertrained.  early_stopping_rounds is already
+    calibrated to 50 × (0.1 / lr), so for lr=0.3 the floor is 50 rounds,
+    exactly the right minimum for that learning rate.
 
     No early stopping — the round count was calibrated in phase 1.
     The final model therefore sees 100% of the data.
     """
     max_bin    = params.get("max_bin", 256)
+    min_iter   = params.get("early_stopping_rounds", 0)
     xgb_params = {k: v for k, v in params.items() if k not in _META_KEYS}
 
+    num_rounds = max(1, max(best_iter, min_iter) + 1)
     dfull = xgb.QuantileDMatrix(X_full, label=y_full, max_bin=max_bin)
     booster = xgb.train(
         xgb_params,
         dfull,
-        num_boost_round=max(1, best_iter + 1),
+        num_boost_round=num_rounds,
         verbose_eval=False,
     )
-    return booster
+    # Return the actual last round index (0-based) so predict_proba's
+    # iteration_range uses the full booster, not the phase-1 best_iter.
+    return booster, num_rounds - 1
 
 
 def _min_gain_threshold(profile: DatasetProfile, y_val: np.ndarray) -> float:
