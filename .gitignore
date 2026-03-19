@@ -1,3 +1,7 @@
+# Data files (large binaries — not tracked in git)
+data/
+notebooks/data/
+
 # Juypter
 .jupyter_ystore.db
 .ipynb_checkpoints

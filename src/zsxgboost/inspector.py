@@ -70,10 +70,17 @@ def _compute_sparsity(X) -> float:
 
 def _detect_sparse_counts(X, sparsity: float) -> bool:
     """
-    Returns True if X looks like Morgan count fingerprints:
+    Returns True if X looks like count fingerprints (Morgan, ECFP, etc.):
       - Majority of values are zero (sparsity > 0.5)
       - Non-zero values are integer-like
-      - Max non-zero value is small (≤ 10), typical of count fingerprints
+      - Max non-zero value is small, OR sparsity is very high (≥ 0.85)
+
+    The max_val <= 10 check distinguishes count fingerprints from general
+    integer features (e.g. ring counts, atom counts) at moderate sparsity.
+    For very sparse data (≥ 0.85 zeros), the high sparsity itself is
+    sufficient evidence of a fingerprint-like representation — some Morgan
+    count fingerprints have occasional counts > 10 for fused ring systems
+    but are still sparse fingerprints and benefit from the sparse code path.
     """
     if sparsity < 0.5:
         return False
@@ -90,9 +97,14 @@ def _detect_sparse_counts(X, sparsity: float) -> bool:
         return False
 
     is_integer_like = float((nonzero_vals == np.floor(nonzero_vals)).mean()) > 0.95
-    max_val = float(nonzero_vals.max())
+    if not is_integer_like:
+        return False
 
-    return is_integer_like and max_val <= 10
+    # Very high sparsity (≥ 0.85) → fingerprint-like regardless of max count.
+    # Moderate sparsity → require small max value to distinguish from general
+    # integer features (ring counts, atom counts, etc.).
+    max_val = float(nonzero_vals.max())
+    return sparsity >= 0.85 or max_val <= 10
 
 
 def _compute_binary_feature_fraction(X, n_sample: int = 5000) -> float:

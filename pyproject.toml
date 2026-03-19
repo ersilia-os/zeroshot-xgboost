@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zsxgboost"
 version = "0.1.0"
-description = "Reasonable zero-shot XGBoost configurations for high dimensional data"
+description = "Zero-shot XGBoost hyperparameter selection with adaptive portfolio preset comparison"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [

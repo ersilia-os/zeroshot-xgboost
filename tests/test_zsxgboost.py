@@ -488,7 +488,7 @@ class TestFitPredict:
         y = (X[:, 0] > 0).astype(int)
         clf = ZeroShotXGBClassifier()
         clf.fit(X, y)
-        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf"}
+        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf_like"}
         assert clf.profile_.n_p_ratio < 1.0
         preds = clf.predict(X)
         assert set(preds).issubset({0, 1})
@@ -497,7 +497,7 @@ class TestFitPredict:
         X, y = make_clf_data(n=600, p=20)
         clf = ZeroShotXGBClassifier()
         clf.fit(X, y)
-        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf"}
+        assert clf.preset_name_ in {"internal", "default", "flaml", "autogluon", "rf_like"}
 
     def test_preset_name_tiny_dataset_is_internal(self):
         # Tiny datasets skip portfolio selection; internal preset is used.

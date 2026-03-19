@@ -166,9 +166,24 @@ def get_params(profile: DatasetProfile, device: str = "cpu",
         else:
             params["learning_rate"] = 0.1
     elif n < 100_000:
-        params["learning_rate"] = 0.05
-    else:
+        # Sparse-count (fingerprint) data: lr=0.1 is sufficient at large n
+        # (Sheridan et al. 2016); halves early_stopping_rounds (100→50) and
+        # reduces estimated rounds ~3× vs lr=0.05.  Dense data keeps 0.05
+        # for more careful convergence on continuous features.
+        params["learning_rate"] = 0.1 if profile.is_sparse_counts else 0.05
+    elif profile.is_sparse_counts:
+        # Sparse fingerprint data at any large scale: lr=0.1 keeps cost
+        # within budget (ratio ~6× default) and converges well regardless of n.
+        # Gradient estimates on sparse integer bits are reliable even at n≥1M.
+        params["learning_rate"] = 0.1
+    elif n < 1_000_000:
+        # Dense data, 100k–1M: careful lr=0.02 for continuous features where
+        # gradient estimates improve more slowly with n.
         params["learning_rate"] = 0.02
+    else:
+        # Dense data at n≥1M: gradient estimates are very accurate; lr=0.05
+        # converges ~5× faster than 0.02 at negligible quality cost.
+        params["learning_rate"] = 0.05
 
     # ------------------------------------------------------------------
     # n_estimators and early stopping
@@ -216,7 +231,9 @@ def get_params(profile: DatasetProfile, device: str = "cpu",
         #   n=578  → 64 (floor at 64)
         #   n=1624 → 162
         #   n=7278 → 512 (ceiling)
-        params["max_leaves"] = max(64, min(512, n // 10))
+        # Cap at 256: generous capacity (4× default's 64-leaf depth-6 tree)
+        # while halving per-round cost vs the previous 512 cap.
+        params["max_leaves"] = max(64, min(256, n // 10))
     else:
         if n < 1_000:
             max_depth = 3
@@ -524,9 +541,12 @@ def _set_classification_params(params: Dict[str, Any], profile: DatasetProfile) 
     # (even mild) it corrects the gradient contribution of each class.
     params["scale_pos_weight"] = round(ratio, 4)
 
-    # max_delta_step = 1 stabilises logistic regression gradient updates
-    # when imbalance is extreme (XGBoost docs recommendation).
-    if ratio > 100:
+    # max_delta_step = 1 stabilises logistic regression gradient updates for
+    # imbalanced data (XGBoost docs recommendation).  Threshold lowered from
+    # 100 to 10: a 10:1 imbalance already produces biased gradient scales
+    # that benefit from clamping, and datasets like ChEMBL (67:1) were
+    # previously missing this stabilisation.
+    if ratio > 10:
         params["max_delta_step"] = 1
 
     # AUC-PR is a more informative metric than AUC-ROC for imbalanced data
