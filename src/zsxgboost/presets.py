@@ -46,7 +46,7 @@ MAXIMIZE_METRICS = frozenset({"auc", "aucpr", "map", "ndcg"})
 
 def _add_task_params(params: Dict[str, Any], profile: DatasetProfile) -> None:
     """Inject objective, eval_metric, and imbalance correction into params."""
-    if profile.task == "binary_classification":
+    if profile.task == "classification":
         params["objective"] = "binary:logistic"
         ratio = profile.imbalance_ratio
         params["scale_pos_weight"] = round(ratio, 4)
@@ -114,8 +114,8 @@ def flaml_params(profile: DatasetProfile, device: str,
     p = profile.n_features
     pct_numeric = 1.0 - profile.binary_feature_fraction
 
-    data = _fd.BINARY if profile.task == "binary_classification" else _fd.REGRESSION
-    n_classes = 2 if profile.task == "binary_classification" else 0
+    data = _fd.BINARY if profile.task == "classification" else _fd.REGRESSION
+    n_classes = 2 if profile.task == "classification" else 0
 
     center = np.array(data["preprocessing"]["center"])
     scale  = np.array(data["preprocessing"]["scale"])

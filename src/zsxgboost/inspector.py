@@ -29,7 +29,7 @@ class DatasetProfile:
     feature_signal_p90: float       # 90th-percentile |Pearson corr|; captures top-feature signal
 
     # Task
-    task: str                # "binary_classification" or "regression"
+    task: str                # "classification" or "regression"
 
     # Binary classification
     imbalance_ratio: float = 1.0    # neg_count / pos_count; 1.0 if balanced or regression
@@ -47,7 +47,7 @@ class DatasetProfile:
             f"feature_signal_strength={self.feature_signal_strength:.3f}",
             f"  task={self.task!r}",
         ]
-        if self.task == "binary_classification":
+        if self.task == "classification":
             lines.append(f"  imbalance_ratio={self.imbalance_ratio:.2f}")
         else:
             lines.append(f"  y_skewness={self.y_skewness:.3f}, y_all_positive={self.y_all_positive}")
@@ -175,12 +175,12 @@ def _estimate_feature_signal(X, y: np.ndarray, n_sample: int = 5000,
 def _detect_task(y: np.ndarray) -> str:
     """
     Auto-detects task from y.
-    Returns "binary_classification" if y contains only two unique integer values,
+    Returns "classification" if y contains only two unique integer values,
     else "regression".
     """
     unique = np.unique(y)
     if len(unique) == 2 and set(unique).issubset({0, 1}):
-        return "binary_classification"
+        return "classification"
     return "regression"
 
 
@@ -193,7 +193,7 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
     X : array-like or scipy sparse matrix, shape (n_samples, n_features)
     y : array-like, shape (n_samples,)
     task : str or None
-        "binary_classification", "regression", or None for auto-detection.
+        "classification", "regression", or None for auto-detection.
 
     Returns
     -------
@@ -204,8 +204,8 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
 
     if task is None:
         task = _detect_task(y)
-    if task not in ("binary_classification", "regression"):
-        raise ValueError(f"task must be 'binary_classification' or 'regression', got {task!r}")
+    if task not in ("classification", "regression"):
+        raise ValueError(f"task must be 'classification' or 'regression', got {task!r}")
 
     sparsity = _compute_sparsity(X)
     is_sparse_counts = _detect_sparse_counts(X, sparsity)
@@ -213,10 +213,10 @@ def inspect(X, y, task: Optional[str] = None) -> DatasetProfile:
     feature_signal_strength, feature_signal_p90 = _estimate_feature_signal(X, y)
     n_p_ratio = float(n_samples) / n_features
 
-    if task == "binary_classification":
+    if task == "classification":
         unique, counts = np.unique(y, return_counts=True)
         if len(unique) != 2:
-            raise ValueError(f"binary_classification requires exactly 2 classes, found {len(unique)}")
+            raise ValueError(f"classification requires exactly 2 classes, found {len(unique)}")
         # Identify positive (minority or label=1) and negative
         label_counts = dict(zip(unique, counts))
         pos_count = label_counts.get(1, counts.min())

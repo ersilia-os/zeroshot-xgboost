@@ -32,14 +32,14 @@ Low-level usage
 ---------------
     from zsxgboost import inspect, get_params
 
-    profile = inspect(X, y, task="binary_classification")
+    profile = inspect(X, y, task="classification")
     params = get_params(profile, device="gpu")
     # params is a plain dict — pass directly to xgb.XGBClassifier(**params)
 """
 
 from .inspector import inspect, DatasetProfile
 from .params import get_params
-from .model import ZeroShotXGBClassifier, ZeroShotXGBRegressor
+from .model import ZeroShotXGBClassifier, ZeroShotXGBRegressor, XGBArtifact
 
 __all__ = [
     "inspect",
@@ -47,4 +47,5 @@ __all__ = [
     "get_params",
     "ZeroShotXGBClassifier",
     "ZeroShotXGBRegressor",
+    "XGBArtifact",
 ]

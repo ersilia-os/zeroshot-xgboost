@@ -33,6 +33,8 @@ The chosen parameters are accessible via .params_.
 The best boosting round is in .best_iteration_.
 """
 
+import dataclasses
+import json
 import os
 import tempfile
 
@@ -190,7 +192,7 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
     def fit(self, X, y):
         logger.set_verbosity(self.verbose)
         y = np.asarray(y).ravel()
-        profile = _inspect(X, y, task="binary_classification")
+        profile = _inspect(X, y, task="classification")
         self.profile_ = profile
         device = _resolve_device(self.device)
 
@@ -268,9 +270,6 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         """
         Export the trained model to an ONNX file.
 
-        Requires the optional ``onnx`` extras:
-            pip install zsxgboost[onnx]
-
         The exported model accepts a float32 input named ``"float_input"``
         with shape ``(n_samples, n_features)`` and produces two outputs:
           - ``"label"``         int64  (n_samples,)   — predicted class
@@ -283,9 +282,45 @@ class ZeroShotXGBClassifier(BaseEstimator, ClassifierMixin):
         """
         check_is_fitted(self, "booster_")
         wrapper = _booster_to_sklearn_wrapper(
-            self.booster_, task="binary_classification"
+            self.booster_, task="classification"
         )
         _export_onnx(wrapper, path, self.profile_.n_features)
+
+    def save(self, directory: str, onnx: bool = True) -> None:
+        """
+        Save the trained model to a directory.
+
+        Always writes ``xgboost.json`` (fit metadata).  The model binary is
+        written as either:
+          - ``xgboost.onnx``   when ``onnx=True`` (default)
+          - ``xgboost.joblib`` when ``onnx=False``
+
+        Parameters
+        ----------
+        directory : str
+            Path to the output directory (created if it does not exist).
+        onnx : bool
+            If True (default), export the booster in ONNX format.
+            If False, serialise the booster with joblib.
+        """
+        check_is_fitted(self, "booster_")
+        os.makedirs(directory, exist_ok=True)
+        if onnx:
+            self.to_onnx(os.path.join(directory, "xgboost.onnx"))
+        else:
+            import joblib
+            joblib.dump(self.booster_, os.path.join(directory, "xgboost.joblib"))
+        metadata = {
+            "task": "classification",
+            "format": "onnx" if onnx else "joblib",
+            "preset_name": self.preset_name_,
+            "best_iteration": self.best_iteration_,
+            "params": self.params_,
+            "profile": dataclasses.asdict(self.profile_),
+            "portfolio_scores": self.portfolio_scores_,
+        }
+        with open(os.path.join(directory, "xgboost.json"), "w") as f:
+            json.dump(metadata, f, indent=2, cls=_NumpyEncoder)
 
 
 class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
@@ -400,9 +435,6 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         """
         Export the trained model to an ONNX file.
 
-        Requires the optional ``onnx`` extras:
-            pip install zsxgboost[onnx]
-
         The exported model accepts a float32 input named ``"float_input"``
         with shape ``(n_samples, n_features)`` and produces one output:
           - ``"variable"`` float32 (n_samples, 1) — predicted values
@@ -416,10 +448,61 @@ class ZeroShotXGBRegressor(BaseEstimator, RegressorMixin):
         wrapper = _booster_to_sklearn_wrapper(self.booster_, task="regression")
         _export_onnx(wrapper, path, self.profile_.n_features)
 
+    def save(self, directory: str, onnx: bool = True) -> None:
+        """
+        Save the trained model to a directory.
+
+        Always writes ``xgboost.json`` (fit metadata).  The model binary is
+        written as either:
+          - ``xgboost.onnx``   when ``onnx=True`` (default)
+          - ``xgboost.joblib`` when ``onnx=False``
+
+        Parameters
+        ----------
+        directory : str
+            Path to the output directory (created if it does not exist).
+        onnx : bool
+            If True (default), export the booster in ONNX format.
+            If False, serialise the booster with joblib.
+        """
+        check_is_fitted(self, "booster_")
+        os.makedirs(directory, exist_ok=True)
+        if onnx:
+            self.to_onnx(os.path.join(directory, "xgboost.onnx"))
+        else:
+            import joblib
+            joblib.dump(self.booster_, os.path.join(directory, "xgboost.joblib"))
+        metadata = {
+            "task": "regression",
+            "format": "onnx" if onnx else "joblib",
+            "preset_name": self.preset_name_,
+            "best_iteration": self.best_iteration_,
+            "params": self.params_,
+            "profile": dataclasses.asdict(self.profile_),
+            "portfolio_scores": self.portfolio_scores_,
+        }
+        with open(os.path.join(directory, "xgboost.json"), "w") as f:
+            json.dump(metadata, f, indent=2, cls=_NumpyEncoder)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that converts numpy scalars to native Python types."""
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 
 def _train_phase1(X_train, y_train, X_val, y_val, params: dict, verbose: bool):
     """
@@ -522,7 +605,7 @@ def _min_gain_threshold(profile: DatasetProfile, y_train: np.ndarray) -> float:
       n_eff=200  → 0.007  (moderate)
       n_eff=500  → 0.005  (base threshold dominates)
     """
-    if profile.task == "binary_classification":
+    if profile.task == "classification":
         n_eff = int(min(np.sum(y_train == 0), np.sum(y_train == 1)))
     else:
         n_eff = len(y_train)
@@ -660,7 +743,7 @@ def _portfolio_select(X, y: np.ndarray,
         ("rf_like",   rf_params(profile, device, nthread=nthread)),
     ]
     params_map = {name: p for name, p in candidates}
-    stratify   = (profile.task == "binary_classification")
+    stratify   = (profile.task == "classification")
 
     # ------------------------------------------------------------------
     # Stage 1: fast parallel ranking
@@ -927,35 +1010,26 @@ def _portfolio_select(X, y: np.ndarray,
 
 def _booster_to_sklearn_wrapper(booster: xgb.Booster, task: str):
     """
-    Load a raw Booster into an sklearn wrapper for onnxmltools export.
-    Saves to a temp file and reloads via the sklearn API.
+    Wrap a raw Booster in an sklearn-compatible object for onnxmltools export.
+
+    Injects the booster via the internal ``_Booster`` attribute to avoid
+    calling ``load_model()``, which triggers a sklearn ≥1.6 / xgboost
+    version incompatibility in ``_load_model_attributes``.
     """
-    with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as f:
-        tmpfile = f.name
-    try:
-        booster.save_model(tmpfile)
-        if task == "binary_classification":
-            wrapper = xgb.XGBClassifier()
-            wrapper.load_model(tmpfile)
-            wrapper.n_classes_ = 2
-        else:
-            wrapper = xgb.XGBRegressor()
-            wrapper.load_model(tmpfile)
-    finally:
-        os.unlink(tmpfile)
+    if task == "classification":
+        wrapper = xgb.XGBClassifier()
+        wrapper._Booster = booster
+        wrapper.n_classes_ = 2
+    else:
+        wrapper = xgb.XGBRegressor()
+        wrapper._Booster = booster
     return wrapper
 
 
 def _export_onnx(model, path: str, n_features: int) -> None:
     """Convert an XGBoost sklearn estimator to ONNX and write to path."""
-    try:
-        from onnxmltools.convert import convert_xgboost
-        from onnxmltools.convert.common.data_types import FloatTensorType
-    except ImportError:
-        raise ImportError(
-            "ONNX export requires optional dependencies. "
-            "Install them with:  pip install zsxgboost[onnx]"
-        )
+    from onnxmltools.convert import convert_xgboost
+    from onnxmltools.convert.common.data_types import FloatTensorType
     onnx_model = convert_xgboost(
         model,
         initial_types=[("float_input", FloatTensorType([None, n_features]))],
@@ -984,7 +1058,7 @@ def _validation_split(X, y, profile: DatasetProfile, stratify: bool,
         return X, X, y, y, False
 
     val_fraction = _VAL_FRACTION
-    if stratify and profile.task == "binary_classification":
+    if stratify and profile.task == "classification":
         ratio = profile.imbalance_ratio
         minority_count = int(profile.n_samples * min(ratio, 1.0) / (1.0 + ratio))
         if minority_count > 0:
@@ -999,3 +1073,142 @@ def _validation_split(X, y, profile: DatasetProfile, stratify: bool,
         stratify=strat,
     )
     return X_train, X_val, y_train, y_val, True
+
+
+# ---------------------------------------------------------------------------
+# Artifact: load a saved model for inference
+# ---------------------------------------------------------------------------
+
+class XGBArtifact:
+    """
+    Load a saved zsxgboost model for forward inference.
+
+    Reads the files written by ``ZeroShotXGBClassifier.save()`` or
+    ``ZeroShotXGBRegressor.save()``:
+      - ``xgboost.onnx``  — ONNX model (preferred)
+      - ``xgboost.json``  — fit metadata (task, params, profile, …)
+
+    Parameters
+    ----------
+    directory : str
+        Path to the directory passed to ``.save()``.
+
+    Attributes
+    ----------
+    metadata : dict
+        Contents of ``xgboost.json``.
+    task : str
+        ``"classification"`` or ``"regression"``.
+    """
+
+    def __init__(self):
+        self._session = None   # onnxruntime.InferenceSession (onnx path)
+        self._booster = None   # xgb.Booster (joblib path)
+        self._format: str = ""
+        self.metadata: dict = {}
+        self.task: str = ""
+
+    @classmethod
+    def load(cls, directory: str) -> "XGBArtifact":
+        """
+        Load the model from *directory*.
+
+        Automatically detects whether the saved format is ONNX or joblib by
+        reading the ``"format"`` field in ``xgboost.json``.  Falls back to
+        probing for the files directly if the field is absent (models saved
+        before this field was introduced).
+
+        Parameters
+        ----------
+        directory : str
+            Directory that was previously passed to ``.save()``.
+
+        Returns
+        -------
+        XGBArtifact
+        """
+        json_path = os.path.join(directory, "xgboost.json")
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"No metadata found at {json_path!r}")
+
+        artifact = cls()
+        with open(json_path) as f:
+            artifact.metadata = json.load(f)
+        artifact.task = artifact.metadata["task"]
+
+        # Resolve format: prefer the field in JSON, fall back to file probing.
+        fmt = artifact.metadata.get("format")
+        if fmt is None:
+            onnx_path = os.path.join(directory, "xgboost.onnx")
+            joblib_path = os.path.join(directory, "xgboost.joblib")
+            if os.path.isfile(onnx_path):
+                fmt = "onnx"
+            elif os.path.isfile(joblib_path):
+                fmt = "joblib"
+            else:
+                raise FileNotFoundError(
+                    f"No model file found in {directory!r} "
+                    "(expected xgboost.onnx or xgboost.joblib)"
+                )
+
+        artifact._format = fmt
+        if fmt == "onnx":
+            import onnxruntime as rt
+            onnx_path = os.path.join(directory, "xgboost.onnx")
+            if not os.path.isfile(onnx_path):
+                raise FileNotFoundError(f"No ONNX model found at {onnx_path!r}")
+            artifact._session = rt.InferenceSession(
+                onnx_path, providers=["CPUExecutionProvider"]
+            )
+        else:
+            import joblib
+            joblib_path = os.path.join(directory, "xgboost.joblib")
+            if not os.path.isfile(joblib_path):
+                raise FileNotFoundError(f"No joblib model found at {joblib_path!r}")
+            artifact._booster = joblib.load(joblib_path)
+
+        return artifact
+
+    def run(self, X) -> np.ndarray:
+        """
+        Run forward inference on *X*.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Input features.
+
+        Returns
+        -------
+        np.ndarray
+            - Classification: shape ``(n_samples, 2)`` — ``[P(class=0), P(class=1)]``
+            - Regression: shape ``(n_samples,)`` — predicted values
+        """
+        if self._session is None and self._booster is None:
+            raise RuntimeError("No model loaded. Call XGBArtifact.load() first.")
+
+        if self._format == "onnx":
+            X_f32 = np.asarray(X, dtype=np.float32)
+            input_name = self._session.get_inputs()[0].name
+            outputs = self._session.run(None, {input_name: X_f32})
+            if self.task == "classification":
+                prob_output = next(
+                    o for o, meta in zip(outputs, self._session.get_outputs())
+                    if meta.name == "probabilities"
+                )
+                return np.asarray(prob_output, dtype=np.float64)
+            else:
+                return np.asarray(outputs[0], dtype=np.float64).ravel()
+        else:
+            best_iter = self.metadata["best_iteration"]
+            dmat = xgb.DMatrix(X)
+            raw = self._booster.predict(
+                dmat, iteration_range=(0, best_iter + 1)
+            )
+            if self.task == "classification":
+                prob_pos = raw
+                return np.column_stack(
+                    [1 - prob_pos, prob_pos]
+                ).astype(np.float64)
+            else:
+                return raw.astype(np.float64)

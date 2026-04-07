@@ -13,7 +13,9 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from zsxgboost import ZeroShotXGBClassifier, ZeroShotXGBRegressor
+import tempfile
+
+from zsxgboost import ZeroShotXGBClassifier, ZeroShotXGBRegressor, XGBArtifact
 from zsxgboost.inspector import inspect, DatasetProfile
 from zsxgboost.params import get_params
 
@@ -60,7 +62,7 @@ class TestInspector:
     def test_profile_fields_clf(self):
         X, y = make_clf_data(n=300, p=10)
         prof = inspect(X, y)
-        assert prof.task == "binary_classification"
+        assert prof.task == "classification"
         assert prof.n_samples == 300
         assert prof.n_features == 10
         assert pytest.approx(prof.n_p_ratio, abs=0.01) == 30.0
@@ -127,7 +129,7 @@ class TestInspector:
     def test_auto_task_detection_clf(self):
         X, y = make_clf_data()
         prof = inspect(X, y)
-        assert prof.task == "binary_classification"
+        assert prof.task == "classification"
 
     def test_auto_task_detection_reg(self):
         X, y = make_reg_data()
@@ -510,3 +512,199 @@ class TestFitPredict:
         clf = ZeroShotXGBClassifier()
         with pytest.raises(Exception):
             clf.predict(RNG.randn(10, 5))
+
+
+# ---------------------------------------------------------------------------
+# XGBArtifact: save / load / run
+# ---------------------------------------------------------------------------
+
+class TestXGBArtifact:
+
+    # --- classifier ---
+
+    def test_classifier_run_shape(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert out.shape == (600, 2)
+
+    def test_classifier_run_probabilities_valid(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert (out >= 0).all() and (out <= 1).all()
+        assert np.allclose(out.sum(axis=1), 1.0, atol=1e-5)
+
+    def test_classifier_run_matches_predict_proba(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        expected = clf.predict_proba(X)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert np.allclose(out, expected, atol=1e-4)
+
+    def test_classifier_task_attribute(self):
+        X, y = make_clf_data(n=400, p=15)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d)
+            artifact = XGBArtifact.load(d)
+        assert artifact.task == "classification"
+
+    def test_classifier_metadata_contents(self):
+        X, y = make_clf_data(n=400, p=15)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d)
+            artifact = XGBArtifact.load(d)
+        assert artifact.metadata["task"] == "classification"
+        assert "preset_name" in artifact.metadata
+        assert "best_iteration" in artifact.metadata
+        assert "params" in artifact.metadata
+        assert "profile" in artifact.metadata
+        assert "portfolio_scores" in artifact.metadata
+
+    # --- regressor ---
+
+    def test_regressor_run_shape(self):
+        X, y = make_reg_data(n=600, p=20)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert out.shape == (600,)
+
+    def test_regressor_run_finite(self):
+        X, y = make_reg_data(n=600, p=20)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert np.isfinite(out).all()
+
+    def test_regressor_run_matches_predict(self):
+        X, y = make_reg_data(n=600, p=20)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        expected = reg.predict(X)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert np.allclose(out, expected, atol=1e-4)
+
+    def test_regressor_task_attribute(self):
+        X, y = make_reg_data(n=400, p=15)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d)
+            artifact = XGBArtifact.load(d)
+        assert artifact.task == "regression"
+
+    # --- joblib path ---
+
+    def test_classifier_joblib_run_shape(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d, onnx=False)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert out.shape == (600, 2)
+
+    def test_classifier_joblib_run_matches_predict_proba(self):
+        X, y = make_clf_data(n=600, p=20)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        expected = clf.predict_proba(X)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d, onnx=False)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert np.allclose(out, expected, atol=1e-6)
+
+    def test_regressor_joblib_run_shape(self):
+        X, y = make_reg_data(n=600, p=20)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d, onnx=False)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert out.shape == (600,)
+
+    def test_regressor_joblib_run_matches_predict(self):
+        X, y = make_reg_data(n=600, p=20)
+        reg = ZeroShotXGBRegressor()
+        reg.fit(X, y)
+        expected = reg.predict(X)
+        with tempfile.TemporaryDirectory() as d:
+            reg.save(d, onnx=False)
+            artifact = XGBArtifact.load(d)
+            out = artifact.run(X)
+        assert np.allclose(out, expected, atol=1e-6)
+
+    def test_joblib_format_field_in_metadata(self):
+        X, y = make_clf_data(n=400, p=15)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d, onnx=False)
+            artifact = XGBArtifact.load(d)
+        assert artifact.metadata["format"] == "joblib"
+        assert artifact._format == "joblib"
+
+    def test_onnx_format_field_in_metadata(self):
+        X, y = make_clf_data(n=400, p=15)
+        clf = ZeroShotXGBClassifier()
+        clf.fit(X, y)
+        with tempfile.TemporaryDirectory() as d:
+            clf.save(d, onnx=True)
+            artifact = XGBArtifact.load(d)
+        assert artifact.metadata["format"] == "onnx"
+        assert artifact._format == "onnx"
+
+    # --- error handling ---
+
+    def test_load_missing_onnx_raises(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            # write only the json, no onnx
+            import json
+            with open(os.path.join(d, "xgboost.json"), "w") as f:
+                json.dump({"task": "classification"}, f)
+            with pytest.raises(FileNotFoundError):
+                XGBArtifact.load(d)
+
+    def test_load_missing_json_raises(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            # write a dummy onnx file, no json
+            with open(os.path.join(d, "xgboost.onnx"), "wb") as f:
+                f.write(b"")
+            with pytest.raises(FileNotFoundError):
+                XGBArtifact.load(d)
+
+    def test_run_before_load_raises(self):
+        artifact = XGBArtifact()
+        with pytest.raises(RuntimeError):
+            artifact.run(RNG.randn(10, 5))

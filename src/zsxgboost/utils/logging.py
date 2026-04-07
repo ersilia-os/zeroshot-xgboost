@@ -78,7 +78,7 @@ class Logger:
             return
 
         task_label = {
-            "binary_classification": "Binary classification",
+            "classification": "Binary classification",
             "regression":            "Regression",
         }.get(profile.task, profile.task)
 
@@ -87,7 +87,7 @@ class Logger:
             f"p={profile.n_features:,}",
             f"n/p={profile.n_p_ratio:.1f}",
         ]
-        if profile.task == "binary_classification":
+        if profile.task == "classification":
             parts.append(f"imbalance={profile.imbalance_ratio:.1f}:1")
         else:
             parts.append(f"skewness={profile.y_skewness:.2f}")

@@ -1,44 +1,99 @@
 # Zero-shot XGBoost
 
-Zero-shot XGBoost (`zsxgboost`) automatically selects XGBoost hyperparameters for binary classification and regression — no grid search, no cross-validation, no tuning required.
+`zsxgboost` automatically selects XGBoost hyperparameters for classification and regression — no grid search, no cross-validation, no tuning required.
 
-Given a dataset `(X, y)`, it profiles the data (size, dimensionality, sparsity, class imbalance, target skew) and picks parameters grounded in published research and practical guidelines. Optionally it runs a fast multi-preset portfolio comparison and selects whichever configuration validates best on a held-out split.
+Given a dataset `(X, y)`, it profiles the data (size, dimensionality, sparsity, class imbalance, target skew) and selects parameters grounded in published research and practical guidelines. Optionally it runs a fast multi-preset portfolio comparison and picks whichever configuration validates best on a held-out split.
 
-## Why?
+## Installation
 
-XGBoost works well out of the box, but its defaults are not optimal for every dataset:
-- A dataset with 200 samples and 1 024 binary features needs very different regularisation than one with 50 000 samples and 10 continuous features.
-- Severely imbalanced classes need `scale_pos_weight`, a patience that scales with the learning rate, and AUC-PR as the stopping metric.
-- Sparse integer count data (e.g. Morgan fingerprints) benefit from `max_bin=64`, `grow_policy="lossguide"`, and per-split feature subsampling.
-- A skewed regression target should use Tweedie loss, not squared error.
+```bash
+pip install git+https://github.com/ersilia-os/zeroshot-xgboost.git
+```
 
-`zsxgboost` encodes these decisions as a set of rules derived from the XGBoost paper, FLAML, AutoGluon, and QSAR modelling guidelines — so you get reasonable parameters without running a single tuning job.
+Requires Python ≥ 3.10.
+
+## Quick start
+
+```python
+from zsxgboost import ZeroShotXGBClassifier, ZeroShotXGBRegressor
+
+# Classification
+clf = ZeroShotXGBClassifier()
+clf.fit(X_train, y_train)
+preds  = clf.predict(X_test)          # binary labels: 0 or 1
+proba  = clf.predict_proba(X_test)    # shape (n, 2) — [P(0), P(1)]
+
+# Regression
+reg = ZeroShotXGBRegressor()
+reg.fit(X_train, y_train)
+preds = reg.predict(X_test)           # shape (n,)
+```
+
+Both estimators are sklearn-compatible and work inside `Pipeline`, `cross_val_score`, etc.
+
+## Saving and loading models
+
+### Save
+
+```python
+clf.save("my_model/")            # default: ONNX format
+clf.save("my_model/", onnx=True) # explicit ONNX
+clf.save("my_model/", onnx=False) # joblib format
+```
+
+`save()` always writes two files:
+- `xgboost.onnx` (or `xgboost.joblib`) — the serialised model
+- `xgboost.json` — fit metadata (parameters, dataset profile, preset scores, best iteration)
+
+### Load and run inference
+
+Use `XGBArtifact` to load a saved model without needing to re-fit:
+
+```python
+from zsxgboost import XGBArtifact
+
+artifact = XGBArtifact.load("my_model/")
+out = artifact.run(X_test)
+# Classification: shape (n, 2) — [P(class=0), P(class=1)]
+# Regression:     shape (n,)   — predicted values
+```
+
+`load()` automatically detects whether the saved format is ONNX or joblib. The fit metadata is available at `artifact.metadata`.
+
+## Inspecting the chosen parameters
+
+```python
+clf.fit(X_train, y_train)
+
+print(clf.profile_)           # dataset statistics
+print(clf.params_)            # full XGBoost parameter dict
+print(clf.preset_name_)       # winning preset: "internal", "default", "flaml", etc.
+print(clf.portfolio_scores_)  # validation score per preset
+print(clf.best_iteration_)    # boosting rounds in the final model
+```
 
 ## How it works
 
 ### Layer 1 — Zero-shot rules
 
-`inspect(X, y)` computes a `DatasetProfile` (sample count, feature count, sparsity, binary-feature fraction, signal strength, class imbalance, target skew). `get_params(profile)` maps that profile to a full XGBoost parameter dictionary using a table of rules:
+`inspect(X, y)` computes a `DatasetProfile` (sample count, feature count, sparsity, signal strength, class imbalance, target skew). `get_params(profile)` maps that profile to a full XGBoost parameter dictionary. Key decisions:
 
-| Condition | Parameter effect |
+| Condition | Effect |
 |---|---|
 | `n_samples` < 10k / 100k / ≥ 100k | `learning_rate` = 0.1 / 0.05 / 0.02 |
-| Any | `early_stopping_rounds` = `50 × (0.1 / lr)` — patience scales with learning rate |
-| `n_samples` < 1 000 | `subsample` = 1.0 (no row sampling on tiny datasets) |
-| `n_p_ratio` < 2 | `max_depth` ≤ 3, `reg_lambda` ×2, `reg_alpha` ≥ 0.5, `gamma` = 0.1 |
-| `n_p_ratio` < 5 | `max_depth` ≤ 4, `reg_lambda` ×1.5, `reg_alpha` ≥ 0.1, `gamma` = 0.1 |
-| `binary_feature_fraction` > 0.8 | `max_depth` − 1 (floor 3) |
-| `n_features` > 500 | `colsample_bytree` ≤ 0.5 |
-| Sparse count data (fingerprints) | lossguide growth, `max_bin=64`, `colsample_bynode=sqrt(p)/p`, L1 reg |
+| Any | `early_stopping_rounds` = `50 × (0.1 / lr)` |
+| `n_samples` < 1 000 | `subsample` = 1.0 |
+| `n_p_ratio` < 2 or < 5 | Shallower trees, heavier regularisation, `gamma` > 0 |
+| Sparse count data (fingerprints) | Lossguide growth, `max_bin=64`, per-split column sampling |
 | Imbalance ratio > 1 | `scale_pos_weight` = neg/pos |
 | Imbalance ratio > 10 | `eval_metric` = `aucpr`, `max_delta_step` = 1 |
-| Regression \|skew\| < 1 | `objective` = `reg:squarederror` |
-| Regression \|skew\| ≥ 1, y > 0 | `objective` = `reg:tweedie` |
-| Regression \|skew\| ≥ 1, y mixed | `objective` = `reg:pseudohubererror` |
+| Regression \|skew\| < 1 | `reg:squarederror` |
+| Regression \|skew\| ≥ 1, y > 0 | `reg:tweedie` |
+| Regression \|skew\| ≥ 1, mixed y | `reg:pseudohubererror` |
 
 ### Layer 2 — Portfolio selection
 
-`ZeroShotXGBClassifier(portfolio=True)` (the default) trains five preset configurations in parallel on a 90/10 validation split and selects the best:
+With `portfolio=True` (the default), five preset configurations are trained in parallel on a 90/10 validation split and the best is selected:
 
 | Preset | Description |
 |---|---|
@@ -48,7 +103,7 @@ XGBoost works well out of the box, but its defaults are not optimal for every da
 | `autogluon` | AutoGluon tabular XGBoost defaults, selected by dataset size and feature type |
 | `rf_like` | XGBoost configured as a Random Forest (colsample_bynode=√p/p, subsample=0.632) |
 
-The portfolio comparison is fast: each preset runs for at most 300 rounds with 30-round patience. A preset wins only if its validation score exceeds the baseline (`default`) by a noise-aware threshold (larger for small datasets where single-split AUC is noisy). The winning preset is then retrained on 100% of the data for the calibrated number of rounds.
+Set `portfolio=False` to skip this step and use only the zero-shot rules (faster, useful as a baseline).
 
 ## Benchmark
 
@@ -62,98 +117,64 @@ Evaluated on 18 ADMET binary classification datasets from the [Therapeutics Data
 | Default XGBoost | 3.06 | 2.78 |
 | Logistic Regression | 3.44 | 3.61 |
 
-Lower rank = better. `zsxgboost` with portfolio selection is **#1 on PR-AUC** (the right metric for imbalanced drug datasets) and statistically tied with Random Forest on ROC-AUC, while being strictly better than plain XGBoost defaults.
+Lower rank = better.
 
-## Installation
+## API reference
 
-```bash
-pip install git+https://github.com/ersilia-os/zeroshot-xgboost.git
-```
-
-Requires Python ≥ 3.10. Core dependencies: `xgboost>=2.0`, `scikit-learn>=1.0`, `scipy>=1.7`, `numpy>=1.21`, `loguru>=0.6`, `rich>=12.0`.
-
-For ONNX export support:
-```bash
-pip install "zsxgboost[onnx]"
-```
-
-## Quick start
+### `ZeroShotXGBClassifier`
 
 ```python
-from zsxgboost import ZeroShotXGBClassifier, ZeroShotXGBRegressor
-
-# Binary classification — portfolio=True is the default
-clf = ZeroShotXGBClassifier()
-clf.fit(X_train, y_train)
-probs = clf.predict_proba(X_test)[:, 1]
-
-# Regression
-reg = ZeroShotXGBRegressor()
-reg.fit(X_train, y_train)
-preds = reg.predict(X_test)
+ZeroShotXGBClassifier(device="cpu", verbose=False, portfolio=True, nthread=-1)
 ```
 
-Both estimators are sklearn-compatible and work inside `Pipeline`, `cross_val_score`, etc.
+| Method | Description |
+|---|---|
+| `.fit(X, y)` | Train the model |
+| `.predict(X)` | Binary labels: 0 or 1 |
+| `.predict_proba(X)` | Class probabilities, shape `(n, 2)` |
+| `.save(directory, onnx=True)` | Save model and metadata to a directory |
 
-## Inspecting the chosen parameters
+Attributes after `.fit()`: `profile_`, `params_`, `preset_name_`, `portfolio_scores_`, `best_iteration_`, `booster_`.
+
+### `ZeroShotXGBRegressor`
 
 ```python
-clf = ZeroShotXGBClassifier()
-clf.fit(X_train, y_train)
-
-print(clf.profile_)        # dataset statistics used to select parameters
-print(clf.params_)         # full XGBoost parameter dictionary
-print(clf.preset_name_)    # which preset won: "internal", "default", "flaml", etc.
-print(clf.portfolio_scores_)  # validation AUC of every competing preset
+ZeroShotXGBRegressor(device="cpu", verbose=False, portfolio=True, nthread=-1)
 ```
 
-Example output for a 5 000-sample, 100-feature dataset with 97:3 class imbalance:
+| Method | Description |
+|---|---|
+| `.fit(X, y)` | Train the model |
+| `.predict(X)` | Predicted values, shape `(n,)` |
+| `.save(directory, onnx=True)` | Save model and metadata to a directory |
 
-```
-DatasetProfile(
-  n_samples=5000, n_features=100, n_p_ratio=50.00
-  sparsity=0.000, is_sparse_counts=False
-  binary_feature_fraction=0.000, feature_signal_strength=0.142
-  task='binary_classification'
-  imbalance_ratio=28.07
-)
+Loss function is chosen automatically: `reg:squarederror`, `reg:tweedie`, or `reg:pseudohubererror`.
 
-{
-  'tree_method': 'hist', 'device': 'cpu',
-  'learning_rate': 0.05, 'n_estimators': 2000, 'early_stopping_rounds': 100,
-  'max_depth': 4, 'min_child_weight': 5, 'subsample': 0.8,
-  'colsample_bytree': 0.8, 'reg_alpha': 0.0, 'reg_lambda': 1.0,
-  'max_bin': 256, 'nthread': 10,
-  'objective': 'binary:logistic', 'scale_pos_weight': 28.07, 'eval_metric': 'aucpr'
-}
-
-preset_name_: 'internal'
-```
-
-## Portfolio selection without full tuning
-
-Set `portfolio=False` to skip preset comparison and use only the zero-shot internal rules. This is faster but gives up the adaptive selection:
+### `XGBArtifact`
 
 ```python
-clf = ZeroShotXGBClassifier(portfolio=False)
-clf.fit(X_train, y_train)
+artifact = XGBArtifact.load(directory)  # load a saved model
+out = artifact.run(X)                   # run inference
 ```
 
-## Low-level API
+| Attribute | Description |
+|---|---|
+| `artifact.task` | `"classification"` or `"regression"` |
+| `artifact.metadata` | Full contents of `xgboost.json` |
 
-You can use the dataset profiler and parameter selector independently:
+`run()` returns shape `(n, 2)` for classification and `(n,)` for regression.
+
+### Low-level API
 
 ```python
 from zsxgboost import inspect, get_params
 
-profile = inspect(X_train, y_train, task="binary_classification")
+profile = inspect(X, y, task="classification")  # or "regression", or None for auto
 params  = get_params(profile, device="cpu")
 
 import xgboost as xgb
-booster = xgb.train(params, xgb.DMatrix(X_train, y_train), num_boost_round=100)
+booster = xgb.train(params, xgb.DMatrix(X, y), num_boost_round=100)
 ```
-
-`inspect()` accepts dense numpy arrays, pandas DataFrames, and scipy sparse matrices.
 
 ## GPU support
 
@@ -161,66 +182,6 @@ booster = xgb.train(params, xgb.DMatrix(X_train, y_train), num_boost_round=100)
 clf = ZeroShotXGBClassifier(device="gpu")   # explicit GPU
 clf = ZeroShotXGBClassifier(device="auto")  # use GPU if CUDA is available
 ```
-
-Everything else is identical; `device="cuda"` is set internally in the XGBoost parameter dict.
-
-## ONNX export
-
-After fitting, export to ONNX for deployment in any ONNX-compatible runtime:
-
-```python
-clf.to_onnx("classifier.onnx")
-reg.to_onnx("regressor.onnx")
-```
-
-Run inference with `onnxruntime`:
-
-```python
-import onnxruntime as ort
-import numpy as np
-
-# Classifier: returns (label int64, probabilities float32 n×2)
-sess  = ort.InferenceSession("classifier.onnx")
-label, proba = sess.run(None, {"float_input": X_test.astype(np.float32)})
-
-# Regressor: returns (predictions float32 n×1)
-sess  = ort.InferenceSession("regressor.onnx")
-preds = sess.run(None, {"float_input": X_test.astype(np.float32)})[0].ravel()
-```
-
-## API reference
-
-### `ZeroShotXGBClassifier(device="cpu", verbose=False, portfolio=True, nthread=-1)`
-
-| Parameter | Description |
-|---|---|
-| `device` | `"cpu"`, `"gpu"`, or `"auto"` |
-| `verbose` | Print training progress and preset selection details |
-| `portfolio` | Run the five-preset portfolio comparison (default `True`) |
-| `nthread` | CPU threads for XGBoost; `-1` uses all available cores |
-
-**Attributes after `.fit()`:**
-
-| Attribute | Type | Description |
-|---|---|---|
-| `profile_` | `DatasetProfile` | Dataset statistics used for parameter selection |
-| `params_` | `dict` | Full XGBoost parameter dict of the winning preset |
-| `preset_name_` | `str` | Winning preset: `"internal"`, `"default"`, `"flaml"`, `"autogluon"`, or `"rf_like"` |
-| `portfolio_scores_` | `dict` | Validation AUC (or −RMSE) for every preset evaluated |
-| `best_iteration_` | `int` | Number of boosting rounds in the final model |
-| `booster_` | `xgb.Booster` | Trained XGBoost booster |
-
-### `ZeroShotXGBRegressor(device="cpu", verbose=False, portfolio=True, nthread=-1)`
-
-Same interface as the classifier. The loss function is chosen automatically from the target distribution: `reg:squarederror` (|skew| < 1), `reg:tweedie` (|skew| ≥ 1 and y > 0), or `reg:pseudohubererror` (|skew| ≥ 1 with mixed-sign targets).
-
-### `inspect(X, y, task=None) → DatasetProfile`
-
-Profile a dataset without training. `task` can be `"binary_classification"`, `"regression"`, or `None` (auto-detected). Returns a `DatasetProfile` dataclass with all statistics used by `get_params`.
-
-### `get_params(profile, device="cpu", nthread=-1) → dict`
-
-Return the zero-shot XGBoost parameter dictionary for a given profile. Useful for integrating with the low-level `xgb.train()` API.
 
 ## About the Ersilia Open Source Initiative
 

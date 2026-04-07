@@ -273,7 +273,7 @@ def get_params(profile: DatasetProfile, device: str = "cpu",
         mcw = max(1, n // 1000)
     mcw = min(mcw, 20)
 
-    if profile.task == "binary_classification":
+    if profile.task == "classification":
         if profile.imbalance_ratio > 10:
             # Extreme minority positives: halve mcw so rare positives can
             # form leaves at all.
@@ -523,7 +523,7 @@ def get_params(profile: DatasetProfile, device: str = "cpu",
     # ------------------------------------------------------------------
     # Task-specific parameters
     # ------------------------------------------------------------------
-    if profile.task == "binary_classification":
+    if profile.task == "classification":
         _set_classification_params(params, profile)
     else:
         _set_regression_params(params, profile)
