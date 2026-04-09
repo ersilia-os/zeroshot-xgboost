@@ -1,3 +1,5 @@
+**THIS REPOSITORY HAS BEEN ARCHIVED AND INCORPORATED INTO [LAZY-QSAR](https://github.com/ersilia-os/lazy-qsar)**
+
 # Zero-shot XGBoost
 
 `zsxgboost` automatically selects XGBoost hyperparameters for classification and regression — no grid search, no cross-validation, no tuning required.
